@@ -3,10 +3,60 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadContentFromMessage,
+  jidNormalizedUser,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const QRCode = require("qrcode");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { spawn } = require("child_process");
+
+// Ensure temp directory exists
+const tempDir = path.join(__dirname, "temp");
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
+}
+
+// Watchlist storage path
+const WATCHLIST_FILE = path.join(__dirname, "watchlist.json");
+
+// Active YouTube download requests mapping (messageId -> { url, requesterJid })
+const activeYtRequests = new Map();
+
+// ──────────────────────────────────────────────
+// Watchlist persistence functions
+// ──────────────────────────────────────────────
+
+function loadWatchlist() {
+  try {
+    if (fs.existsSync(WATCHLIST_FILE)) {
+      return JSON.parse(fs.readFileSync(WATCHLIST_FILE, "utf-8"));
+    }
+  } catch (err) {
+    console.error("Error loading watchlist:", err);
+  }
+  return {};
+}
+
+function saveWatchlist(watchlist) {
+  try {
+    fs.writeFileSync(WATCHLIST_FILE, JSON.stringify(watchlist, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Error saving watchlist:", err);
+  }
+}
+
+// Helper to download media message content from Baileys
+async function downloadMediaMessage(message, type) {
+  const stream = await downloadContentFromMessage(message, type);
+  let buffer = Buffer.from([]);
+  for await (const chunk of stream) {
+    buffer = Buffer.concat([buffer, chunk]);
+  }
+  return buffer;
+}
 
 // ──────────────────────────────────────────────
 // QR Web Server
@@ -93,7 +143,6 @@ function buildHTML() {
 </html>`;
   }
 
-  // Page with QR — auto-refreshes every 30s to pick up new QR codes
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -154,10 +203,6 @@ function buildHTML() {
 </html>`;
 }
 
-/**
- * Start a tiny HTTP server to serve the QR code as an image.
- * Railway provides PORT env var.
- */
 function startQRServer() {
   const PORT = process.env.PORT || 3000;
 
@@ -182,7 +227,6 @@ function startQRServer() {
       return;
     }
 
-    // Serve the HTML page
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
@@ -200,14 +244,172 @@ function startQRServer() {
 // Helpers
 // ──────────────────────────────────────────────
 
-/**
- * Normalise a user-supplied phone number into a WhatsApp JID.
- * Strips spaces, dashes, plus signs, and leading zeros after
- * the country code.
- */
 function phoneToJid(raw) {
   const cleaned = raw.replace(/[\s\-\+\(\)]/g, "");
   return `${cleaned}@s.whatsapp.net`;
+}
+
+async function downloadFromCobalt(videoUrl, isAudioOnly) {
+  const instances = [
+    "https://api.cobalt.tools",
+    "https://api.cobalt.best",
+    "https://cobalt.api.ryz.cx",
+    "https://cobalt.colbster.com",
+  ];
+
+  let lastError = null;
+
+  for (const instance of instances) {
+    try {
+      console.log(`Trying Cobalt instance: ${instance}`);
+      const response = await fetch(`${instance}/api/json`, {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url: videoUrl,
+          isAudioOnly: isAudioOnly,
+          videoQuality: "720",
+          filenamePattern: "basic",
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error ${response.status} from ${instance}`);
+      }
+
+      const data = await response.json();
+      if (data.status === "error") {
+        throw new Error(data.text || "Unknown Cobalt error");
+      }
+
+      if ((data.status === "stream" || data.status === "redirect") && data.url) {
+        console.log(`Downloading file from: ${data.url}`);
+        const fileResponse = await fetch(data.url);
+        if (!fileResponse.ok) {
+          throw new Error(`Failed to download media file from ${data.url}`);
+        }
+        const buffer = Buffer.from(await fileResponse.arrayBuffer());
+        return { buffer, filename: data.filename || (isAudioOnly ? "audio.mp3" : "video.mp4") };
+      }
+
+      throw new Error(`Unsupported status response: ${data.status}`);
+    } catch (err) {
+      console.warn(`Cobalt instance ${instance} failed: ${err.message}`);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("All Cobalt instances failed");
+}
+
+let ytDlpPath = "yt-dlp";
+
+async function ensureLatestYtDlp() {
+  const isLinux = process.platform === "linux";
+  if (!isLinux) {
+    console.log("ℹ️ Non-Linux platform. Using system-installed yt-dlp.");
+    return "yt-dlp";
+  }
+
+  const localYtDlpPath = path.join(tempDir, "yt-dlp");
+  console.log("🔄 Ensuring latest yt-dlp binary is installed...");
+  try {
+    const { execSync } = require("child_process");
+    execSync(`curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${localYtDlpPath}"`, { stdio: "ignore" });
+    execSync(`chmod a+rx "${localYtDlpPath}"`, { stdio: "ignore" });
+    console.log(`✅ Downloaded latest yt-dlp binary to ${localYtDlpPath}`);
+    return localYtDlpPath;
+  } catch (err) {
+    console.error("⚠️ Failed to download latest yt-dlp binary, falling back to system-installed version:", err);
+    return "yt-dlp";
+  }
+}
+
+// Helper to spawn yt-dlp command safely without shell escaping vulnerability
+function runYtDlp(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ytDlpPath, args);
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(`yt-dlp exited with code ${code}\nStderr: ${stderr}`));
+      }
+    });
+  });
+}
+
+// Periodic check for watchlisted profile pictures
+async function checkProfilePictures(sock, watchlist) {
+  console.log("⏰ Running periodic profile picture check...");
+  let changed = false;
+
+  for (const targetJid of Object.keys(watchlist)) {
+    const target = watchlist[targetJid];
+    if (!target.requesters || target.requesters.length === 0) continue;
+
+    try {
+      let currentDpUrl = null;
+      try {
+        currentDpUrl = await sock.profilePictureUrl(targetJid, "image");
+      } catch (err) {
+        currentDpUrl = null; // No profile picture set or privacy restricted
+      }
+
+      if (currentDpUrl !== target.lastDpUrl) {
+        console.log(`📸 Profile picture changed for ${target.phone}`);
+        target.lastDpUrl = currentDpUrl;
+        changed = true;
+
+        if (currentDpUrl) {
+          const response = await fetch(currentDpUrl);
+          if (response.ok) {
+            const buffer = Buffer.from(await response.arrayBuffer());
+            for (const requesterJid of target.requesters) {
+              try {
+                await sock.sendMessage(requesterJid, {
+                  image: buffer,
+                  caption: `🔔 Watchlist Alert: *${target.phone}* updated their profile picture!`,
+                });
+              } catch (e) {
+                console.error(`Failed to send DP update to ${requesterJid}:`, e);
+              }
+            }
+          }
+        } else {
+          for (const requesterJid of target.requesters) {
+            try {
+              await sock.sendMessage(requesterJid, {
+                text: `🔔 Watchlist Alert: *${target.phone}* removed their profile picture.`,
+              });
+            } catch (e) {
+              console.error(`Failed to send DP removal update to ${requesterJid}:`, e);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`Error checking profile picture for ${targetJid}:`, err);
+    }
+  }
+
+  if (changed) {
+    saveWatchlist(watchlist);
+  }
 }
 
 // ──────────────────────────────────────────────
@@ -218,18 +420,19 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
   const { version } = await fetchLatestBaileysVersion();
 
-  const logger = pino({ level: "silent" }); // keep Railway logs clean
+  const logger = pino({ level: "silent" });
 
   const sock = makeWASocket({
     version,
     auth: state,
     logger,
-    printQRInTerminal: false, // we serve QR via web instead
+    printQRInTerminal: false,
     browser: ["WA-DP-Bot", "Chrome", "1.0.0"],
-    // Increase timeouts for Railway cold starts
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
   });
+
+  let ppCheckInterval = null;
 
   // ── Auth / connection events ──────────────────
 
@@ -245,18 +448,19 @@ async function startBot() {
     }
 
     if (connection === "close") {
-      const statusCode =
-        lastDisconnect?.error?.output?.statusCode;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+
+      if (ppCheckInterval) {
+        clearInterval(ppCheckInterval);
+        ppCheckInterval = null;
+      }
 
       if (statusCode === DisconnectReason.loggedOut) {
         console.log("❌ Session logged out. Delete auth_info/ and restart.");
         process.exit(1);
       }
 
-      // Auto-reconnect on transient failures
-      console.log(
-        `⚠️  Connection closed (code ${statusCode}). Reconnecting…`
-      );
+      console.log(`⚠️  Connection closed (code ${statusCode}). Reconnecting…`);
       botConnected = false;
       setTimeout(startBot, 3000);
     }
@@ -265,6 +469,15 @@ async function startBot() {
       console.log("✅ Connected to WhatsApp!");
       currentQR = null;
       botConnected = true;
+
+      // Start periodic check every 10 minutes
+      if (!ppCheckInterval) {
+        ppCheckInterval = setInterval(() => {
+          checkProfilePictures(sock, loadWatchlist());
+        }, 10 * 60 * 1000);
+        // Run once immediately on startup
+        checkProfilePictures(sock, loadWatchlist());
+      }
     }
   });
 
@@ -273,84 +486,404 @@ async function startBot() {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
+    const watchlist = loadWatchlist();
+
     for (const msg of messages) {
-      // Skip status broadcasts, own messages, protocol messages
-      if (msg.key.remoteJid === "status@broadcast") continue;
-      if (msg.key.fromMe) continue;
       if (!msg.message) continue;
 
+      // Identify if the message was sent to self-chat
+      const isSelf = jidNormalizedUser(msg.key.remoteJid) === jidNormalizedUser(sock.user.id);
+      
+      // Allow self-chat messages or commands from others, but ignore non-self messages sent by us
+      if (msg.key.fromMe && !isSelf) continue;
+
+      // Handle status broadcasts for watchlisted contacts
+      if (msg.key.remoteJid === "status@broadcast") {
+        const participantJid = msg.key.participant || msg.participant;
+        if (!participantJid) continue;
+
+        const normalizedParticipant = jidNormalizedUser(participantJid);
+        if (watchlist[normalizedParticipant]) {
+          console.log(`📱 Status update detected from watched contact: ${normalizedParticipant}`);
+          const target = watchlist[normalizedParticipant];
+
+          const imageMsg = msg.message?.imageMessage;
+          const videoMsg = msg.message?.videoMessage;
+          const audioMsg = msg.message?.audioMessage;
+          const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
+
+          for (const requesterJid of target.requesters) {
+            try {
+              if (imageMsg) {
+                const buffer = await downloadMediaMessage(imageMsg, "image");
+                await sock.sendMessage(requesterJid, {
+                  image: buffer,
+                  caption: `🔔 Watchlist Status Alert from *${target.phone}* (Image)${imageMsg.caption ? `:\n\n${imageMsg.caption}` : ""}`,
+                });
+              } else if (videoMsg) {
+                const buffer = await downloadMediaMessage(videoMsg, "video");
+                await sock.sendMessage(requesterJid, {
+                  video: buffer,
+                  caption: `🔔 Watchlist Status Alert from *${target.phone}* (Video)${videoMsg.caption ? `:\n\n${videoMsg.caption}` : ""}`,
+                });
+              } else if (audioMsg) {
+                const buffer = await downloadMediaMessage(audioMsg, "audio");
+                await sock.sendMessage(requesterJid, {
+                  audio: buffer,
+                  mimetype: "audio/ogg; codecs=opus",
+                });
+              } else if (text) {
+                await sock.sendMessage(requesterJid, {
+                  text: `🔔 Watchlist Status Alert from *${target.phone}* (Text):\n\n${text}`,
+                });
+              }
+            } catch (err) {
+              console.error(`Failed to forward status from ${target.phone} to ${requesterJid}:`, err);
+            }
+          }
+        }
+        continue;
+      }
+
+      // Read message text
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         "";
 
-      if (!text.toLowerCase().startsWith("!dp")) continue;
+      const chatJid = msg.key.remoteJid;
 
-      const parts = text.trim().split(/\s+/);
-      if (parts.length < 2) {
-        await sock.sendMessage(msg.key.remoteJid, {
-          text: "❌ Usage: *!dp <phone_number>*\nExample: `!dp 94722666467`",
+      // Check if message is a reply to one of our active YouTube prompt requests
+      const quotedId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+      if (quotedId && activeYtRequests.has(quotedId)) {
+        const request = activeYtRequests.get(quotedId);
+        const choice = text.trim();
+
+        if (choice === "1") {
+          activeYtRequests.delete(quotedId); // Consume the request
+          await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+
+          const id = quotedId;
+          const outputPath = path.join(tempDir, `video_${id}.mp4`);
+          console.log(`🎥 Downloading video from: ${request.url}`);
+
+          let videoBuffer = null;
+          let filename = `video_${id}.mp4`;
+
+          try {
+            // Primary download attempt: Cobalt API
+            const cobaltResult = await downloadFromCobalt(request.url, false);
+            videoBuffer = cobaltResult.buffer;
+            filename = cobaltResult.filename;
+            console.log("✅ Successfully downloaded video using Cobalt API.");
+          } catch (cobaltErr) {
+            console.warn("⚠️ Cobalt download failed. Falling back to local yt-dlp...", cobaltErr.message);
+            try {
+              await runYtDlp([
+                "--extractor-args", "youtube:player_client=android,web",
+                "-f", "best[ext=mp4]/best",
+                "--recode-video", "mp4",
+                "--no-playlist",
+                "--max-filesize", "50M",
+                "-o", outputPath,
+                request.url
+              ]);
+
+              if (fs.existsSync(outputPath)) {
+                videoBuffer = fs.readFileSync(outputPath);
+              } else {
+                throw new Error("Video file was not created by yt-dlp");
+              }
+            } catch (dlpErr) {
+              console.error("❌ Fallback local yt-dlp download failed:", dlpErr);
+              await sock.sendMessage(chatJid, {
+                text: `❌ Failed to download video. It might be too large (>50MB) or restricted.\n\nError: ${dlpErr.message}`,
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+              continue;
+            } finally {
+              if (fs.existsSync(outputPath)) {
+                fs.unlinkSync(outputPath);
+              }
+            }
+          }
+
+          if (videoBuffer) {
+            try {
+              const fileSizeInMB = videoBuffer.length / (1024 * 1024);
+              if (fileSizeInMB > 16) {
+                await sock.sendMessage(chatJid, {
+                  document: videoBuffer,
+                  mimetype: "video/mp4",
+                  fileName: filename,
+                  caption: "🎥 Here is your video (sent as document due to size limit)",
+                }, { quoted: msg });
+              } else {
+                await sock.sendMessage(chatJid, {
+                  video: videoBuffer,
+                  caption: "🎥 Here is your video!",
+                }, { quoted: msg });
+              }
+              await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+            } catch (err) {
+              console.error("Error sending video message:", err);
+              await sock.sendMessage(chatJid, { text: "❌ Error sending video file." }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            }
+          }
+          continue;
+        } else if (choice === "2") {
+          activeYtRequests.delete(quotedId); // Consume the request
+          await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+
+          const id = quotedId;
+          const outputPathPattern = path.join(tempDir, `audio_${id}.%(ext)s`);
+          const expectedFilePath = path.join(tempDir, `audio_${id}.mp3`);
+          console.log(`🎵 Downloading audio from: ${request.url}`);
+
+          let audioBuffer = null;
+          let filename = `audio_${id}.mp3`;
+
+          try {
+            // Primary download attempt: Cobalt API
+            const cobaltResult = await downloadFromCobalt(request.url, true);
+            audioBuffer = cobaltResult.buffer;
+            filename = cobaltResult.filename;
+            console.log("✅ Successfully downloaded audio using Cobalt API.");
+          } catch (cobaltErr) {
+            console.warn("⚠️ Cobalt audio download failed. Falling back to local yt-dlp...", cobaltErr.message);
+            try {
+              await runYtDlp([
+                "--extractor-args", "youtube:player_client=android,web",
+                "-x",
+                "--audio-format", "mp3",
+                "--no-playlist",
+                "-o", outputPathPattern,
+                request.url
+              ]);
+
+              if (fs.existsSync(expectedFilePath)) {
+                audioBuffer = fs.readFileSync(expectedFilePath);
+              } else {
+                throw new Error("Audio file was not created by yt-dlp");
+              }
+            } catch (dlpErr) {
+              console.error("❌ Fallback local yt-dlp audio download failed:", dlpErr);
+              await sock.sendMessage(chatJid, {
+                text: `❌ Failed to download audio.\n\nError: ${dlpErr.message}`,
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+              continue;
+            } finally {
+              if (fs.existsSync(expectedFilePath)) {
+                fs.unlinkSync(expectedFilePath);
+              }
+            }
+          }
+
+          if (audioBuffer) {
+            try {
+              await sock.sendMessage(chatJid, {
+                document: audioBuffer,
+                mimetype: "audio/mpeg",
+                fileName: filename,
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+            } catch (err) {
+              console.error("Error sending audio message:", err);
+              await sock.sendMessage(chatJid, { text: "❌ Error sending audio file." }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            }
+          }
+          continue;
+        } else {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Invalid selection. Please reply with *1* (Video) or *2* (Audio).",
+          }, { quoted: msg });
+          continue;
+        }
+      }
+
+      // --- COMMAND: !dp ---
+      if (text.toLowerCase().startsWith("!dp")) {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Usage: *!dp <phone_number>*\nExample: `!dp 94722666467`",
+          }, { quoted: msg });
+          continue;
+        }
+
+        const targetPhone = parts[1];
+        const targetJid = phoneToJid(targetPhone);
+
+        console.log(`📸 !dp request from ${chatJid} for ${targetPhone}`);
+
+        try {
+          await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+
+          let ppUrl;
+          try {
+            ppUrl = await sock.profilePictureUrl(targetJid, "image");
+          } catch (err) {
+            await sock.sendMessage(chatJid, {
+              text: `⚠️ Could not fetch DP for *${targetPhone}*.\nThe user may have no DP set or their privacy settings block it.`,
+            }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            continue;
+          }
+
+          const response = await fetch(ppUrl);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const buffer = Buffer.from(await response.arrayBuffer());
+
+          await sock.sendMessage(chatJid, {
+            image: buffer,
+            caption: `📸 Display picture of *${targetPhone}*`,
+          }, { quoted: msg });
+
+          await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+          console.log(`✅ Sent DP of ${targetPhone} to ${chatJid}`);
+        } catch (err) {
+          console.error(`Error handling !dp for ${targetPhone}:`, err);
+          await sock.sendMessage(chatJid, {
+            text: `❌ Something went wrong fetching the DP. Please try again.`,
+          }, { quoted: msg });
+          await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+        }
+        continue;
+      }
+
+      // --- COMMAND: !watchlist ---
+      if (text.toLowerCase().startsWith("!watchlist")) {
+        const parts = text.trim().split(/\s+/);
+        const subCommand = parts[1]?.toLowerCase();
+
+        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
+
+        if (subCommand === "add") {
+          const targetPhone = parts[2];
+          if (!targetPhone) {
+            await sock.sendMessage(chatJid, {
+              text: "❌ Usage: *!watchlist add <phone_number>*",
+            }, { quoted: msg });
+            continue;
+          }
+
+          const targetJid = phoneToJid(targetPhone);
+          
+          if (!watchlist[targetJid]) {
+            watchlist[targetJid] = {
+              phone: targetPhone,
+              lastDpUrl: null,
+              requesters: [],
+            };
+          }
+
+          if (!watchlist[targetJid].requesters.includes(senderJid)) {
+            watchlist[targetJid].requesters.push(senderJid);
+          }
+
+          // Initial DP fetch
+          try {
+            watchlist[targetJid].lastDpUrl = await sock.profilePictureUrl(targetJid, "image");
+          } catch (e) {
+            watchlist[targetJid].lastDpUrl = null;
+          }
+
+          saveWatchlist(watchlist);
+
+          await sock.sendMessage(chatJid, {
+            text: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
+          }, { quoted: msg });
+          continue;
+        }
+
+        if (subCommand === "remove" || subCommand === "delete") {
+          const targetPhone = parts[2];
+          if (!targetPhone) {
+            await sock.sendMessage(chatJid, {
+              text: "❌ Usage: *!watchlist remove <phone_number>*",
+            }, { quoted: msg });
+            continue;
+          }
+
+          const targetJid = phoneToJid(targetPhone);
+
+          if (watchlist[targetJid]) {
+            watchlist[targetJid].requesters = watchlist[targetJid].requesters.filter(
+              (r) => r !== senderJid
+            );
+
+            if (watchlist[targetJid].requesters.length === 0) {
+              delete watchlist[targetJid];
+            }
+            saveWatchlist(watchlist);
+
+            await sock.sendMessage(chatJid, {
+              text: `✅ Removed *${targetPhone}* from your watchlist.`,
+            }, { quoted: msg });
+          } else {
+            await sock.sendMessage(chatJid, {
+              text: `⚠️ *${targetPhone}* is not in your watchlist.`,
+            }, { quoted: msg });
+          }
+          continue;
+        }
+
+        if (subCommand === "list") {
+          const watchedList = [];
+          for (const key of Object.keys(watchlist)) {
+            if (watchlist[key].requesters.includes(senderJid)) {
+              watchedList.push(`• ${watchlist[key].phone}`);
+            }
+          }
+
+          if (watchedList.length === 0) {
+            await sock.sendMessage(chatJid, {
+              text: "📂 Your watchlist is currently empty.",
+            }, { quoted: msg });
+          } else {
+            await sock.sendMessage(chatJid, {
+              text: `📂 *Your Watchlist:*\n\n${watchedList.join("\n")}`,
+            }, { quoted: msg });
+          }
+          continue;
+        }
+
+        // Show generic watchlist usage
+        await sock.sendMessage(chatJid, {
+          text: `ℹ️ *Watchlist Commands:*\n\n• \`!watchlist add <phone>\`\n• \`!watchlist remove <phone>\`\n• \`!watchlist list\``,
         }, { quoted: msg });
         continue;
       }
 
-      const targetPhone = parts[1];
-      const targetJid = phoneToJid(targetPhone);
-      const chatJid = msg.key.remoteJid;
-
-      console.log(
-        `📸 !dp request from ${chatJid} for ${targetPhone}`
-      );
-
-      try {
-        // React to acknowledge
-        await sock.sendMessage(chatJid, {
-          react: { text: "⏳", key: msg.key },
-        });
-
-        // Fetch the profile picture URL (full-res)
-        let ppUrl;
-        try {
-          ppUrl = await sock.profilePictureUrl(targetJid, "image");
-        } catch (err) {
-          // No profile picture set or privacy restrictions
+      // --- COMMAND: !yt ---
+      if (text.toLowerCase().startsWith("!yt")) {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
           await sock.sendMessage(chatJid, {
-            text: `⚠️ Could not fetch DP for *${targetPhone}*.\nThe user may have no DP set or their privacy settings block it.`,
+            text: "❌ Usage: *!yt <youtube_url>*\nExample: `!yt https://youtu.be/2i2khp_npdE`",
           }, { quoted: msg });
-
-          await sock.sendMessage(chatJid, {
-            react: { text: "❌", key: msg.key },
-          });
           continue;
         }
 
-        // Download the image
-        const response = await fetch(ppUrl);
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+        const ytUrl = parts[1];
+        if (!ytUrl.includes("youtube.com") && !ytUrl.includes("youtu.be")) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Please provide a valid YouTube URL.",
+          }, { quoted: msg });
+          continue;
         }
-        const buffer = Buffer.from(await response.arrayBuffer());
 
-        // Send the image back
-        await sock.sendMessage(chatJid, {
-          image: buffer,
-          caption: `📸 Display picture of *${targetPhone}*`,
-        }, { quoted: msg });
-
-        await sock.sendMessage(chatJid, {
-          react: { text: "✅", key: msg.key },
+        const promptText = `🎥 *YouTube Downloader*\n\nChoose format for:\n${ytUrl}\n\n1️⃣ Video (MP4)\n2️⃣ Audio (MP3)\n\n*Reply/quote this message* with *1* or *2* to choose.`;
+        
+        const sent = await sock.sendMessage(chatJid, { text: promptText }, { quoted: msg });
+        activeYtRequests.set(sent.key.id, {
+          url: ytUrl,
+          requesterJid: chatJid,
         });
-
-        console.log(`✅ Sent DP of ${targetPhone} to ${chatJid}`);
-      } catch (err) {
-        console.error(`Error handling !dp for ${targetPhone}:`, err);
-        await sock.sendMessage(chatJid, {
-          text: `❌ Something went wrong fetching the DP. Please try again.`,
-        }, { quoted: msg });
-
-        await sock.sendMessage(chatJid, {
-          react: { text: "❌", key: msg.key },
-        });
+        continue;
       }
     }
   });
@@ -358,8 +891,13 @@ async function startBot() {
 
 // ── Entry point ─────────────────────────────────
 console.log("🤖 WA-DP-Bot starting…");
-startQRServer();
-startBot().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+(async () => {
+  try {
+    ytDlpPath = await ensureLatestYtDlp();
+    startQRServer();
+    await startBot();
+  } catch (err) {
+    console.error("Fatal error during startup:", err);
+    process.exit(1);
+  }
+})();
