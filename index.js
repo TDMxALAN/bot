@@ -6,40 +6,199 @@ const {
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const QRCode = require("qrcode");
+const http = require("http");
+
+// ──────────────────────────────────────────────
+// QR Web Server
+// ──────────────────────────────────────────────
+
+let currentQR = null; // holds the latest QR text
+let botConnected = false;
+
+function buildHTML() {
+  if (botConnected) {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WA-DP-Bot</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      background: #0a0a0a;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: #fff;
+    }
+    .card {
+      text-align: center;
+      background: #111;
+      border-radius: 16px;
+      padding: 48px;
+      border: 1px solid #25D366;
+      box-shadow: 0 0 40px rgba(37, 211, 102, 0.15);
+    }
+    .check { font-size: 64px; margin-bottom: 16px; }
+    h1 { color: #25D366; font-size: 24px; }
+    p { color: #888; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">✅</div>
+    <h1>Bot Connected!</h1>
+    <p>WA-DP-Bot is running and linked to WhatsApp.</p>
+  </div>
+</body>
+</html>`;
+  }
+
+  if (!currentQR) {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WA-DP-Bot — Waiting</title>
+  <meta http-equiv="refresh" content="3">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      background: #0a0a0a;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: #fff;
+    }
+    .card { text-align: center; }
+    .spinner {
+      width: 48px; height: 48px;
+      border: 4px solid #333; border-top: 4px solid #25D366;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    p { color: #888; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <p>Generating QR code… Page will auto-refresh.</p>
+  </div>
+</body>
+</html>`;
+  }
+
+  // Page with QR — auto-refreshes every 30s to pick up new QR codes
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WA-DP-Bot — Scan QR</title>
+  <meta http-equiv="refresh" content="30">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      background: #0a0a0a;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: #fff;
+    }
+    .card {
+      text-align: center;
+      background: #111;
+      border-radius: 16px;
+      padding: 32px;
+      border: 1px solid #222;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; color: #25D366; }
+    .subtitle { color: #888; font-size: 14px; margin-bottom: 24px; }
+    .qr-container {
+      background: #fff;
+      border-radius: 12px;
+      padding: 16px;
+      display: inline-block;
+      margin-bottom: 20px;
+    }
+    .qr-container img { display: block; width: 280px; height: 280px; }
+    .instructions {
+      color: #aaa; font-size: 13px; line-height: 1.6;
+    }
+    .instructions strong { color: #fff; }
+    .refresh-note { color: #555; font-size: 11px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🤖 WA-DP-Bot</h1>
+    <p class="subtitle">Link your WhatsApp to get started</p>
+    <div class="qr-container">
+      <img src="/qr.png" alt="QR Code" />
+    </div>
+    <p class="instructions">
+      <strong>1.</strong> Open WhatsApp on your phone<br>
+      <strong>2.</strong> Go to <strong>Linked Devices</strong><br>
+      <strong>3.</strong> Tap <strong>Link a Device</strong><br>
+      <strong>4.</strong> Point your camera at this QR code
+    </p>
+    <p class="refresh-note">Page auto-refreshes every 30s for new QR codes</p>
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * Start a tiny HTTP server to serve the QR code as an image.
+ * Railway provides PORT env var.
+ */
+function startQRServer() {
+  const PORT = process.env.PORT || 3000;
+
+  const server = http.createServer(async (req, res) => {
+    if (req.url === "/qr.png" && currentQR) {
+      try {
+        const pngBuffer = await QRCode.toBuffer(currentQR, {
+          errorCorrectionLevel: "L",
+          margin: 2,
+          scale: 8,
+          color: { dark: "#000000", light: "#FFFFFF" },
+        });
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Cache-Control": "no-store",
+        });
+        res.end(pngBuffer);
+      } catch (err) {
+        res.writeHead(500);
+        res.end("Error generating QR");
+      }
+      return;
+    }
+
+    // Serve the HTML page
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    });
+    res.end(buildHTML());
+  });
+
+  server.listen(PORT, () => {
+    console.log(`🌐 QR web server running on port ${PORT}`);
+    console.log(`   Open your Railway public URL to scan the QR code`);
+  });
+}
 
 // ──────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────
-
-/**
- * Render QR as a compact UTF-8 string that fits inside Railway's
- * narrower terminal (≈80-100 cols). Uses the "quarter-block"
- * technique: each character cell encodes TWO vertical module rows,
- * halving the height and keeping width small.
- *
- * Characters used:
- *   █ (U+2588) — both rows dark
- *   ▀ (U+2580) — top dark, bottom light
- *   ▄ (U+2584) — top light, bottom dark
- *   ' '        — both rows light
- */
-async function printCompactQR(text) {
-  // Generate the QR as a utf8 half-block string.
-  // margin: 2 ensures scannability; errorCorrectionLevel "L" keeps it small.
-  const qrString = await QRCode.toString(text, {
-    type: "utf8",
-    errorCorrectionLevel: "L",
-    margin: 2,
-  });
-
-  console.log("\n");
-  console.log("╔══════════════════════════════════════════╗");
-  console.log("║   Scan this QR code with WhatsApp        ║");
-  console.log("║   (Linked Devices → Link a Device)       ║");
-  console.log("╚══════════════════════════════════════════╝");
-  console.log(qrString);
-  console.log("Waiting for scan...\n");
-}
 
 /**
  * Normalise a user-supplied phone number into a WhatsApp JID.
@@ -65,7 +224,7 @@ async function startBot() {
     version,
     auth: state,
     logger,
-    printQRInTerminal: false, // we handle QR ourselves for Railway compat
+    printQRInTerminal: false, // we serve QR via web instead
     browser: ["WA-DP-Bot", "Chrome", "1.0.0"],
     // Increase timeouts for Railway cold starts
     connectTimeoutMs: 60_000,
@@ -80,7 +239,9 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      await printCompactQR(qr);
+      currentQR = qr;
+      botConnected = false;
+      console.log("📱 New QR code generated — open your Railway URL to scan it");
     }
 
     if (connection === "close") {
@@ -96,11 +257,14 @@ async function startBot() {
       console.log(
         `⚠️  Connection closed (code ${statusCode}). Reconnecting…`
       );
+      botConnected = false;
       setTimeout(startBot, 3000);
     }
 
     if (connection === "open") {
       console.log("✅ Connected to WhatsApp!");
+      currentQR = null;
+      botConnected = true;
     }
   });
 
@@ -194,6 +358,7 @@ async function startBot() {
 
 // ── Entry point ─────────────────────────────────
 console.log("🤖 WA-DP-Bot starting…");
+startQRServer();
 startBot().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
