@@ -24,14 +24,12 @@ const QRCode = require("qrcode");
  *   ' '        — both rows light
  */
 async function printCompactQR(text) {
-  // qrcode library can return a 2-D boolean matrix via toDataURL → but
-  // the simplest API is toString with "utf8" type which already does the
-  // half-block trick. We keep margin small so it doesn't overflow.
+  // Generate the QR as a utf8 half-block string.
+  // margin: 2 ensures scannability; errorCorrectionLevel "L" keeps it small.
   const qrString = await QRCode.toString(text, {
     type: "utf8",
-    errorCorrectionLevel: "L", // fewer modules → smaller QR
-    margin: 1,
-    small: true,
+    errorCorrectionLevel: "L",
+    margin: 2,
   });
 
   console.log("\n");
