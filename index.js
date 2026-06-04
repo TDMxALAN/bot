@@ -249,6 +249,62 @@ function phoneToJid(raw) {
   return `${cleaned}@s.whatsapp.net`;
 }
 
+async function downloadFromCobalt(videoUrl, isAudioOnly) {
+  const instances = [
+    "https://api.cobalt.tools",
+    "https://api.cobalt.best",
+    "https://cobalt.api.ryz.cx",
+    "https://cobalt.colbster.com",
+  ];
+
+  let lastError = null;
+
+  for (const instance of instances) {
+    try {
+      console.log(`Trying Cobalt instance: ${instance}`);
+      const response = await fetch(`${instance}/api/json`, {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          url: videoUrl,
+          isAudioOnly: isAudioOnly,
+          videoQuality: "720",
+          filenamePattern: "basic",
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error ${response.status} from ${instance}`);
+      }
+
+      const data = await response.json();
+      if (data.status === "error") {
+        throw new Error(data.text || "Unknown Cobalt error");
+      }
+
+      if ((data.status === "stream" || data.status === "redirect") && data.url) {
+        console.log(`Downloading file from: ${data.url}`);
+        const fileResponse = await fetch(data.url);
+        if (!fileResponse.ok) {
+          throw new Error(`Failed to download media file from ${data.url}`);
+        }
+        const buffer = Buffer.from(await fileResponse.arrayBuffer());
+        return { buffer, filename: data.filename || (isAudioOnly ? "audio.mp3" : "video.mp4") };
+      }
+
+      throw new Error(`Unsupported status response: ${data.status}`);
+    } catch (err) {
+      console.warn(`Cobalt instance ${instance} failed: ${err.message}`);
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("All Cobalt instances failed");
+}
+
 let ytDlpPath = "yt-dlp";
 
 async function ensureLatestYtDlp() {
@@ -511,47 +567,68 @@ async function startBot() {
           const outputPath = path.join(tempDir, `video_${id}.mp4`);
           console.log(`🎥 Downloading video from: ${request.url}`);
 
+          let videoBuffer = null;
+          let filename = `video_${id}.mp4`;
+
           try {
-            await runYtDlp([
-              "--extractor-args", "youtube:player_client=android,web",
-              "-f", "best[ext=mp4]/best",
-              "--recode-video", "mp4",
-              "--no-playlist",
-              "--max-filesize", "50M",
-              "-o", outputPath,
-              request.url
-            ]);
+            // Primary download attempt: Cobalt API
+            const cobaltResult = await downloadFromCobalt(request.url, false);
+            videoBuffer = cobaltResult.buffer;
+            filename = cobaltResult.filename;
+            console.log("✅ Successfully downloaded video using Cobalt API.");
+          } catch (cobaltErr) {
+            console.warn("⚠️ Cobalt download failed. Falling back to local yt-dlp...", cobaltErr.message);
+            try {
+              await runYtDlp([
+                "--extractor-args", "youtube:player_client=android,web",
+                "-f", "best[ext=mp4]/best",
+                "--recode-video", "mp4",
+                "--no-playlist",
+                "--max-filesize", "50M",
+                "-o", outputPath,
+                request.url
+              ]);
 
-            if (fs.existsSync(outputPath)) {
-              const stats = fs.statSync(outputPath);
-              const fileSizeInMB = stats.size / (1024 * 1024);
+              if (fs.existsSync(outputPath)) {
+                videoBuffer = fs.readFileSync(outputPath);
+              } else {
+                throw new Error("Video file was not created by yt-dlp");
+              }
+            } catch (dlpErr) {
+              console.error("❌ Fallback local yt-dlp download failed:", dlpErr);
+              await sock.sendMessage(chatJid, {
+                text: `❌ Failed to download video. It might be too large (>50MB) or restricted.\n\nError: ${dlpErr.message}`,
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+              continue;
+            } finally {
+              if (fs.existsSync(outputPath)) {
+                fs.unlinkSync(outputPath);
+              }
+            }
+          }
 
+          if (videoBuffer) {
+            try {
+              const fileSizeInMB = videoBuffer.length / (1024 * 1024);
               if (fileSizeInMB > 16) {
                 await sock.sendMessage(chatJid, {
-                  document: fs.readFileSync(outputPath),
+                  document: videoBuffer,
                   mimetype: "video/mp4",
-                  fileName: `video_${id}.mp4`,
+                  fileName: filename,
                   caption: "🎥 Here is your video (sent as document due to size limit)",
                 }, { quoted: msg });
               } else {
                 await sock.sendMessage(chatJid, {
-                  video: fs.readFileSync(outputPath),
+                  video: videoBuffer,
                   caption: "🎥 Here is your video!",
                 }, { quoted: msg });
               }
               await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
-            } else {
-              throw new Error("Video file was not created by yt-dlp");
-            }
-          } catch (err) {
-            console.error("Error downloading YouTube video:", err);
-            await sock.sendMessage(chatJid, {
-              text: `❌ Failed to download video. It might be too large (>50MB) or restricted.\n\nError: ${err.message}`,
-            }, { quoted: msg });
-            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
-          } finally {
-            if (fs.existsSync(outputPath)) {
-              fs.unlinkSync(outputPath);
+            } catch (err) {
+              console.error("Error sending video message:", err);
+              await sock.sendMessage(chatJid, { text: "❌ Error sending video file." }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
             }
           }
           continue;
@@ -564,35 +641,58 @@ async function startBot() {
           const expectedFilePath = path.join(tempDir, `audio_${id}.mp3`);
           console.log(`🎵 Downloading audio from: ${request.url}`);
 
-          try {
-            await runYtDlp([
-              "--extractor-args", "youtube:player_client=android,web",
-              "-x",
-              "--audio-format", "mp3",
-              "--no-playlist",
-              "-o", outputPathPattern,
-              request.url
-            ]);
+          let audioBuffer = null;
+          let filename = `audio_${id}.mp3`;
 
-            if (fs.existsSync(expectedFilePath)) {
+          try {
+            // Primary download attempt: Cobalt API
+            const cobaltResult = await downloadFromCobalt(request.url, true);
+            audioBuffer = cobaltResult.buffer;
+            filename = cobaltResult.filename;
+            console.log("✅ Successfully downloaded audio using Cobalt API.");
+          } catch (cobaltErr) {
+            console.warn("⚠️ Cobalt audio download failed. Falling back to local yt-dlp...", cobaltErr.message);
+            try {
+              await runYtDlp([
+                "--extractor-args", "youtube:player_client=android,web",
+                "-x",
+                "--audio-format", "mp3",
+                "--no-playlist",
+                "-o", outputPathPattern,
+                request.url
+              ]);
+
+              if (fs.existsSync(expectedFilePath)) {
+                audioBuffer = fs.readFileSync(expectedFilePath);
+              } else {
+                throw new Error("Audio file was not created by yt-dlp");
+              }
+            } catch (dlpErr) {
+              console.error("❌ Fallback local yt-dlp audio download failed:", dlpErr);
               await sock.sendMessage(chatJid, {
-                document: fs.readFileSync(expectedFilePath),
+                text: `❌ Failed to download audio.\n\nError: ${dlpErr.message}`,
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+              continue;
+            } finally {
+              if (fs.existsSync(expectedFilePath)) {
+                fs.unlinkSync(expectedFilePath);
+              }
+            }
+          }
+
+          if (audioBuffer) {
+            try {
+              await sock.sendMessage(chatJid, {
+                document: audioBuffer,
                 mimetype: "audio/mpeg",
-                fileName: `audio_${id}.mp3`,
+                fileName: filename,
               }, { quoted: msg });
               await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
-            } else {
-              throw new Error("Audio file was not created by yt-dlp");
-            }
-          } catch (err) {
-            console.error("Error downloading YouTube audio:", err);
-            await sock.sendMessage(chatJid, {
-              text: `❌ Failed to download audio.\n\nError: ${err.message}`,
-            }, { quoted: msg });
-            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
-          } finally {
-            if (fs.existsSync(expectedFilePath)) {
-              fs.unlinkSync(expectedFilePath);
+            } catch (err) {
+              console.error("Error sending audio message:", err);
+              await sock.sendMessage(chatJid, { text: "❌ Error sending audio file." }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
             }
           }
           continue;
