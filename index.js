@@ -513,7 +513,7 @@ async function startBot() {
 
           try {
             await runYtDlp([
-              "--extractor-args", "youtube:player_client=ios,web",
+              "--extractor-args", "youtube:player_client=android,web",
               "-f", "best[ext=mp4]/best",
               "--recode-video", "mp4",
               "--no-playlist",
@@ -566,7 +566,7 @@ async function startBot() {
 
           try {
             await runYtDlp([
-              "--extractor-args", "youtube:player_client=ios,web",
+              "--extractor-args", "youtube:player_client=android,web",
               "-x",
               "--audio-format", "mp3",
               "--no-playlist",
