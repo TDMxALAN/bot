@@ -249,7 +249,7 @@ function phoneToJid(raw) {
   return `${cleaned}@s.whatsapp.net`;
 }
 
-async function downloadFromCobalt(videoUrl, isAudioOnly) {
+async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
   const instances = [
     "https://api.cobalt.tools",
     "https://api.cobalt.best",
@@ -271,7 +271,7 @@ async function downloadFromCobalt(videoUrl, isAudioOnly) {
         body: JSON.stringify({
           url: videoUrl,
           isAudioOnly: isAudioOnly,
-          videoQuality: "720",
+          videoQuality: quality,
           filenamePattern: "basic",
         }),
       });
@@ -855,6 +855,97 @@ async function startBot() {
         await sock.sendMessage(chatJid, {
           text: `ℹ️ *Watchlist Commands:*\n\n• \`!watchlist add <phone>\`\n• \`!watchlist remove <phone>\`\n• \`!watchlist list\``,
         }, { quoted: msg });
+        continue;
+      }
+
+      // --- COMMAND: !fb ---
+      if (text.toLowerCase().startsWith("!fb")) {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Usage: *!fb <facebook_url>*\nExample: `!fb https://www.facebook.com/share/r/18nfTFFM3g/`",
+          }, { quoted: msg });
+          continue;
+        }
+
+        const fbUrl = parts[1];
+        if (!fbUrl.includes("facebook.com") && !fbUrl.includes("fb.watch") && !fbUrl.includes("fb.gg")) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Please provide a valid Facebook URL.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+
+        const id = msg.key.id;
+        const outputPath = path.join(tempDir, `fb_video_${id}.mp4`);
+        console.log(`🎥 Downloading Facebook video from: ${fbUrl}`);
+
+        let videoBuffer = null;
+        let filename = `fb_video_${id}.mp4`;
+
+        try {
+          // Primary download attempt: Cobalt API with max quality
+          const cobaltResult = await downloadFromCobalt(fbUrl, false, "max");
+          videoBuffer = cobaltResult.buffer;
+          filename = cobaltResult.filename;
+          console.log("✅ Successfully downloaded FB video using Cobalt API.");
+        } catch (cobaltErr) {
+          console.warn("⚠️ Cobalt FB download failed. Falling back to local yt-dlp...", cobaltErr.message);
+          try {
+            await runYtDlp([
+              "--extractor-args", "facebook:player_client=android,web",
+              "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+              "--recode-video", "mp4",
+              "--no-playlist",
+              "--max-filesize", "50M",
+              "-o", outputPath,
+              fbUrl
+            ]);
+
+            if (fs.existsSync(outputPath)) {
+              videoBuffer = fs.readFileSync(outputPath);
+            } else {
+              throw new Error("Video file was not created by yt-dlp");
+            }
+          } catch (dlpErr) {
+            console.error("❌ Fallback local yt-dlp FB download failed:", dlpErr);
+            await sock.sendMessage(chatJid, {
+              text: `❌ Failed to download Facebook video. It might be too large (>50MB) or restricted.\n\nError: ${dlpErr.message}`,
+            }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            continue;
+          } finally {
+            if (fs.existsSync(outputPath)) {
+              fs.unlinkSync(outputPath);
+            }
+          }
+        }
+
+        if (videoBuffer) {
+          try {
+            const fileSizeInMB = videoBuffer.length / (1024 * 1024);
+            if (fileSizeInMB > 16) {
+              await sock.sendMessage(chatJid, {
+                document: videoBuffer,
+                mimetype: "video/mp4",
+                fileName: filename,
+                caption: "🎥 Here is your Facebook video (sent as document due to size limit)",
+              }, { quoted: msg });
+            } else {
+              await sock.sendMessage(chatJid, {
+                video: videoBuffer,
+                caption: "🎥 Here is your Facebook video!",
+              }, { quoted: msg });
+            }
+            await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+          } catch (err) {
+            console.error("Error sending FB video message:", err);
+            await sock.sendMessage(chatJid, { text: "❌ Error sending video file." }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+          }
+        }
         continue;
       }
 
