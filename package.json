@@ -1,5 +1,5 @@
 {
-  "name": "wa-dp-bot",
+  "name": "netzee-bot",
   "version": "1.0.0",
   "description": "WhatsApp bot that fetches display pictures",
   "main": "index.js",
