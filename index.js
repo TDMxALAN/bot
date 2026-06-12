@@ -72,7 +72,7 @@ function buildHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WA-DP-Bot</title>
+  <title>Netzee-bot</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -99,7 +99,7 @@ function buildHTML() {
   <div class="card">
     <div class="check">✅</div>
     <h1>Bot Connected!</h1>
-    <p>WA-DP-Bot is running and linked to WhatsApp.</p>
+    <p>Netzee-bot is running and linked to WhatsApp.</p>
   </div>
 </body>
 </html>`;
@@ -111,7 +111,7 @@ function buildHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WA-DP-Bot — Waiting</title>
+  <title>Netzee-bot — Waiting</title>
   <meta http-equiv="refresh" content="3">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -148,7 +148,7 @@ function buildHTML() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WA-DP-Bot — Scan QR</title>
+  <title>Netzee-bot — Scan QR</title>
   <meta http-equiv="refresh" content="30">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -186,7 +186,7 @@ function buildHTML() {
 </head>
 <body>
   <div class="card">
-    <h1>🤖 WA-DP-Bot</h1>
+    <h1>🤖 Netzee-bot</h1>
     <p class="subtitle">Link your WhatsApp to get started</p>
     <div class="qr-container">
       <img src="/qr.png" alt="QR Code" />
@@ -249,7 +249,7 @@ function phoneToJid(raw) {
   return `${cleaned}@s.whatsapp.net`;
 }
 
-async function downloadFromCobalt(videoUrl, isAudioOnly) {
+async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
   const instances = [
     "https://api.cobalt.tools",
     "https://api.cobalt.best",
@@ -271,7 +271,7 @@ async function downloadFromCobalt(videoUrl, isAudioOnly) {
         body: JSON.stringify({
           url: videoUrl,
           isAudioOnly: isAudioOnly,
-          videoQuality: "720",
+          videoQuality: quality,
           filenamePattern: "basic",
         }),
       });
@@ -427,7 +427,7 @@ async function startBot() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ["WA-DP-Bot", "Chrome", "1.0.0"],
+    browser: ["Netzee-bot", "Chrome", "1.0.0"],
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
   });
@@ -495,7 +495,7 @@ async function startBot() {
       const isSelf = jidNormalizedUser(msg.key.remoteJid) === jidNormalizedUser(sock.user.id);
       
       // Allow self-chat messages or commands from others, but ignore non-self messages sent by us
-      if (msg.key.fromMe && !isSelf) continue;
+      // if (msg.key.fromMe && !isSelf) continue; // commented out to allow bot owner to run commands
 
       // Handle status broadcasts for watchlisted contacts
       if (msg.key.remoteJid === "status@broadcast") {
@@ -858,6 +858,97 @@ async function startBot() {
         continue;
       }
 
+      // --- COMMAND: !fb ---
+      if (text.toLowerCase().startsWith("!fb")) {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Usage: *!fb <facebook_url>*\nExample: `!fb https://www.facebook.com/share/r/18nfTFFM3g/`",
+          }, { quoted: msg });
+          continue;
+        }
+
+        const fbUrl = parts[1];
+        if (!fbUrl.includes("facebook.com") && !fbUrl.includes("fb.watch") && !fbUrl.includes("fb.gg")) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Please provide a valid Facebook URL.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+
+        const id = msg.key.id;
+        const outputPath = path.join(tempDir, `fb_video_${id}.mp4`);
+        console.log(`🎥 Downloading Facebook video from: ${fbUrl}`);
+
+        let videoBuffer = null;
+        let filename = `fb_video_${id}.mp4`;
+
+        try {
+          // Primary download attempt: Cobalt API with max quality
+          const cobaltResult = await downloadFromCobalt(fbUrl, false, "480");
+          videoBuffer = cobaltResult.buffer;
+          filename = cobaltResult.filename;
+          console.log("✅ Successfully downloaded FB video using Cobalt API.");
+        } catch (cobaltErr) {
+          console.warn("⚠️ Cobalt FB download failed. Falling back to local yt-dlp...", cobaltErr.message);
+          try {
+            await runYtDlp([
+              "--extractor-args", "facebook:player_client=android,web",
+              "-f", "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best",
+              "--recode-video", "mp4",
+              "--no-playlist",
+              "--max-filesize", "50M",
+              "-o", outputPath,
+              fbUrl
+            ]);
+
+            if (fs.existsSync(outputPath)) {
+              videoBuffer = fs.readFileSync(outputPath);
+            } else {
+              throw new Error("Video file was not created by yt-dlp");
+            }
+          } catch (dlpErr) {
+            console.error("❌ Fallback local yt-dlp FB download failed:", dlpErr);
+            await sock.sendMessage(chatJid, {
+              text: `❌ Failed to download Facebook video. It might be too large (>50MB) or restricted.\n\nError: ${dlpErr.message}`,
+            }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            continue;
+          } finally {
+            if (fs.existsSync(outputPath)) {
+              fs.unlinkSync(outputPath);
+            }
+          }
+        }
+
+        if (videoBuffer) {
+          try {
+            const fileSizeInMB = videoBuffer.length / (1024 * 1024);
+            if (fileSizeInMB > 16) {
+              await sock.sendMessage(chatJid, {
+                document: videoBuffer,
+                mimetype: "video/mp4",
+                fileName: filename,
+                caption: "🎥 Here is your Facebook video (sent as document due to size limit)",
+              }, { quoted: msg });
+            } else {
+              await sock.sendMessage(chatJid, {
+                video: videoBuffer,
+                caption: "🎥 Here is your Facebook video!",
+              }, { quoted: msg });
+            }
+            await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+          } catch (err) {
+            console.error("Error sending FB video message:", err);
+            await sock.sendMessage(chatJid, { text: "❌ Error sending video file." }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+          }
+        }
+        continue;
+      }
+
       // --- COMMAND: !yt ---
       if (text.toLowerCase().startsWith("!yt")) {
         const parts = text.trim().split(/\s+/);
@@ -890,7 +981,7 @@ async function startBot() {
 }
 
 // ── Entry point ─────────────────────────────────
-console.log("🤖 WA-DP-Bot starting…");
+console.log("🤖 Netzee-bot starting…");
 (async () => {
   try {
     ytDlpPath = await ensureLatestYtDlp();
