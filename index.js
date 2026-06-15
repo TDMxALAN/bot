@@ -22,12 +22,42 @@ if (!fs.existsSync(tempDir)) {
 // Watchlist storage path
 const WATCHLIST_FILE = path.join(__dirname, "watchlist.json");
 
+// Callblocking storage path
+const CALLBLOCKING_FILE = path.join(__dirname, "callblocking.json");
+
 // Active YouTube download requests mapping (messageId -> { url, requesterJid })
 const activeYtRequests = new Map();
 
 // ──────────────────────────────────────────────
-// Watchlist persistence functions
+// Watchlist and Callblocking persistence functions
 // ──────────────────────────────────────────────
+
+function loadCallBlocking() {
+  try {
+    if (fs.existsSync(CALLBLOCKING_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CALLBLOCKING_FILE, "utf-8"));
+      return data.enabled || false;
+    }
+  } catch (err) {
+    console.error("Error loading callblocking:", err);
+  }
+  return false;
+}
+
+function saveCallBlocking(enabled) {
+  try {
+    fs.writeFileSync(CALLBLOCKING_FILE, JSON.stringify({ enabled }, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Error saving callblocking:", err);
+  }
+}
+
+let isCallBlockingEnabled = loadCallBlocking();
+
+function setCallBlocking(enabled) {
+  isCallBlockingEnabled = enabled;
+  saveCallBlocking(enabled);
+}
 
 function loadWatchlist() {
   try {
@@ -438,6 +468,17 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
+  sock.ev.on("call", async (calls) => {
+    if (isCallBlockingEnabled) {
+      for (const call of calls) {
+        if (call.status === "offer" || call.status === "ringing") {
+          console.log(`Rejecting call from ${call.from}`);
+          await sock.rejectCall(call.id, call.from);
+        }
+      }
+    }
+  });
+
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -750,6 +791,28 @@ async function startBot() {
             text: `❌ Something went wrong fetching the DP. Please try again.`,
           }, { quoted: msg });
           await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+        }
+        continue;
+      }
+
+      // --- COMMAND: !callblocking ---
+      if (text.toLowerCase().startsWith("!callblocking")) {
+        if (!isSelf) {
+          // Command only executable in self chat
+          continue;
+        }
+
+        const parts = text.trim().split(/\s+/);
+        const subCommand = parts[1]?.toLowerCase();
+
+        if (subCommand === "on") {
+          setCallBlocking(true);
+          await sock.sendMessage(chatJid, { text: "✅ Call blocking is now ON. All incoming calls will be automatically declined." }, { quoted: msg });
+        } else if (subCommand === "off") {
+          setCallBlocking(false);
+          await sock.sendMessage(chatJid, { text: "✅ Call blocking is now OFF." }, { quoted: msg });
+        } else {
+          await sock.sendMessage(chatJid, { text: "❌ Usage: *!callblocking on* or *!callblocking off*" }, { quoted: msg });
         }
         continue;
       }
