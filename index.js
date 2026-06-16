@@ -1107,6 +1107,100 @@ async function startBot() {
         continue;
       }
 
+      // --- COMMAND: !ig ---
+      if (text.toLowerCase().startsWith("!ig")) {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Usage: *!ig <instagram_url>*\nExample: `!ig https://www.instagram.com/reel/ABC123/`",
+          }, { quoted: msg });
+          continue;
+        }
+
+        const igUrl = parts[1];
+        const isInstagram =
+          igUrl.includes("instagram.com") ||
+          igUrl.includes("instagr.am");
+
+        if (!isInstagram) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Please provide a valid Instagram URL.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+
+        const id = msg.key.id;
+        const outputPath = path.join(tempDir, `ig_video_${id}.mp4`);
+        console.log(`📸 Downloading Instagram video from: ${igUrl}`);
+
+        let videoBuffer = null;
+        let filename = `ig_video_${id}.mp4`;
+
+        try {
+          // Primary download attempt: Cobalt API
+          const cobaltResult = await downloadFromCobalt(igUrl, false, "1080");
+          videoBuffer = cobaltResult.buffer;
+          filename = cobaltResult.filename;
+          console.log("✅ Successfully downloaded Instagram video using Cobalt API.");
+        } catch (cobaltErr) {
+          console.warn("⚠️ Cobalt Instagram download failed. Falling back to local yt-dlp...", cobaltErr.message);
+          try {
+            await runYtDlp([
+              "-f", "best[ext=mp4]/best",
+              "--recode-video", "mp4",
+              "--no-playlist",
+              "--max-filesize", "50M",
+              "-o", outputPath,
+              igUrl
+            ]);
+
+            if (fs.existsSync(outputPath)) {
+              videoBuffer = fs.readFileSync(outputPath);
+            } else {
+              throw new Error("Video file was not created by yt-dlp");
+            }
+          } catch (dlpErr) {
+            console.error("❌ Fallback local yt-dlp Instagram download failed:", dlpErr);
+            await sock.sendMessage(chatJid, {
+              text: `❌ Failed to download Instagram video. It might be too large (>50MB), private, or restricted.\n\nError: ${dlpErr.message}`,
+            }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            continue;
+          } finally {
+            if (fs.existsSync(outputPath)) {
+              fs.unlinkSync(outputPath);
+            }
+          }
+        }
+
+        if (videoBuffer) {
+          try {
+            const fileSizeInMB = videoBuffer.length / (1024 * 1024);
+            if (fileSizeInMB > 16) {
+              await sock.sendMessage(chatJid, {
+                document: videoBuffer,
+                mimetype: "video/mp4",
+                fileName: filename,
+                caption: "📸 Here is your Instagram video (sent as document due to size limit)",
+              }, { quoted: msg });
+            } else {
+              await sock.sendMessage(chatJid, {
+                video: videoBuffer,
+                caption: "📸 Here is your Instagram video!",
+              }, { quoted: msg });
+            }
+            await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+          } catch (err) {
+            console.error("Error sending Instagram video message:", err);
+            await sock.sendMessage(chatJid, { text: "❌ Error sending Instagram video file." }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+          }
+        }
+        continue;
+      }
+
       // --- COMMAND: !yt ---
       if (text.toLowerCase().startsWith("!yt")) {
         const parts = text.trim().split(/\s+/);
