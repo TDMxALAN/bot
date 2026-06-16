@@ -22,12 +22,42 @@ if (!fs.existsSync(tempDir)) {
 // Watchlist storage path
 const WATCHLIST_FILE = path.join(__dirname, "watchlist.json");
 
+// Callblocking storage path
+const CALLBLOCKING_FILE = path.join(__dirname, "callblocking.json");
+
 // Active YouTube download requests mapping (messageId -> { url, requesterJid })
 const activeYtRequests = new Map();
 
 // ──────────────────────────────────────────────
-// Watchlist persistence functions
+// Watchlist and Callblocking persistence functions
 // ──────────────────────────────────────────────
+
+function loadCallBlocking() {
+  try {
+    if (fs.existsSync(CALLBLOCKING_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CALLBLOCKING_FILE, "utf-8"));
+      return data.enabled || false;
+    }
+  } catch (err) {
+    console.error("Error loading callblocking:", err);
+  }
+  return false;
+}
+
+function saveCallBlocking(enabled) {
+  try {
+    fs.writeFileSync(CALLBLOCKING_FILE, JSON.stringify({ enabled }, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Error saving callblocking:", err);
+  }
+}
+
+let isCallBlockingEnabled = loadCallBlocking();
+
+function setCallBlocking(enabled) {
+  isCallBlockingEnabled = enabled;
+  saveCallBlocking(enabled);
+}
 
 function loadWatchlist() {
   try {
@@ -419,6 +449,17 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
+  sock.ev.on("call", async (calls) => {
+    if (isCallBlockingEnabled) {
+      for (const call of calls) {
+        if (call.status === "offer" || call.status === "ringing") {
+          console.log(`Rejecting call from ${call.from}`);
+          await sock.rejectCall(call.id, call.from);
+        }
+      }
+    }
+  });
+
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -735,6 +776,28 @@ async function startBot() {
         continue;
       }
 
+      // --- COMMAND: !callblocking ---
+      if (text.toLowerCase().startsWith("!callblocking")) {
+        if (!isSelf) {
+          // Command only executable in self chat
+          continue;
+        }
+
+        const parts = text.trim().split(/\s+/);
+        const subCommand = parts[1]?.toLowerCase();
+
+        if (subCommand === "on") {
+          setCallBlocking(true);
+          await sock.sendMessage(chatJid, { text: "✅ Call blocking is now ON. All incoming calls will be automatically declined." }, { quoted: msg });
+        } else if (subCommand === "off") {
+          setCallBlocking(false);
+          await sock.sendMessage(chatJid, { text: "✅ Call blocking is now OFF." }, { quoted: msg });
+        } else {
+          await sock.sendMessage(chatJid, { text: "❌ Usage: *!callblocking on* or *!callblocking off*" }, { quoted: msg });
+        }
+        continue;
+      }
+
       // --- COMMAND: !watchlist ---
       if (text.toLowerCase().startsWith("!watchlist")) {
         const parts = text.trim().split(/\s+/);
@@ -924,6 +987,101 @@ async function startBot() {
           } catch (err) {
             console.error("Error sending FB video message:", err);
             await sock.sendMessage(chatJid, { text: "❌ Error sending video file." }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+          }
+        }
+        continue;
+      }
+
+      // --- COMMAND: !tt ---
+      if (text.toLowerCase().startsWith("!tt")) {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Usage: *!tt <tiktok_url>*\nExample: `!tt https://www.tiktok.com/@user/video/123456789`",
+          }, { quoted: msg });
+          continue;
+        }
+
+        const ttUrl = parts[1];
+        const isTikTok =
+          ttUrl.includes("tiktok.com") ||
+          ttUrl.includes("vm.tiktok.com") ||
+          ttUrl.includes("vt.tiktok.com");
+
+        if (!isTikTok) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Please provide a valid TikTok URL.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+
+        const id = msg.key.id;
+        const outputPath = path.join(tempDir, `tt_video_${id}.mp4`);
+        console.log(`🎵 Downloading TikTok video from: ${ttUrl}`);
+
+        let videoBuffer = null;
+        let filename = `tt_video_${id}.mp4`;
+
+        try {
+          // Primary download attempt: Cobalt API
+          const cobaltResult = await downloadFromCobalt(ttUrl, false, "1080");
+          videoBuffer = cobaltResult.buffer;
+          filename = cobaltResult.filename;
+          console.log("✅ Successfully downloaded TikTok video using Cobalt API.");
+        } catch (cobaltErr) {
+          console.warn("⚠️ Cobalt TikTok download failed. Falling back to local yt-dlp...", cobaltErr.message);
+          try {
+            await runYtDlp([
+              "-f", "best[ext=mp4]/best",
+              "--recode-video", "mp4",
+              "--no-playlist",
+              "--max-filesize", "50M",
+              "-o", outputPath,
+              ttUrl
+            ]);
+
+            if (fs.existsSync(outputPath)) {
+              videoBuffer = fs.readFileSync(outputPath);
+            } else {
+              throw new Error("Video file was not created by yt-dlp");
+            }
+          } catch (dlpErr) {
+            console.error("❌ Fallback local yt-dlp TikTok download failed:", dlpErr);
+            await sock.sendMessage(chatJid, {
+              text: `❌ Failed to download TikTok video. It might be too large (>50MB) or restricted.\n\nError: ${dlpErr.message}`,
+            }, { quoted: msg });
+            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            continue;
+          } finally {
+            if (fs.existsSync(outputPath)) {
+              fs.unlinkSync(outputPath);
+            }
+          }
+        }
+
+        if (videoBuffer) {
+          try {
+            const fileSizeInMB = videoBuffer.length / (1024 * 1024);
+            if (fileSizeInMB > 16) {
+              await sock.sendMessage(chatJid, {
+                document: videoBuffer,
+                mimetype: "video/mp4",
+                fileName: filename,
+                caption: "🎵 Here is your TikTok video (sent as document due to size limit)",
+              }, { quoted: msg });
+            } else {
+              await sock.sendMessage(chatJid, {
+                video: videoBuffer,
+                caption: "🎵 Here is your TikTok video!",
+              }, { quoted: msg });
+            }
+            await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+          } catch (err) {
+            console.error("Error sending TikTok video message:", err);
+            await sock.sendMessage(chatJid, { text: "❌ Error sending TikTok video file." }, { quoted: msg });
             await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
           }
         }
