@@ -305,28 +305,9 @@ async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
   throw lastError || new Error("All Cobalt instances failed");
 }
 
-let ytDlpPath = "yt-dlp";
-
-async function ensureLatestYtDlp() {
-  const isLinux = process.platform === "linux";
-  if (!isLinux) {
-    console.log("ℹ️ Non-Linux platform. Using system-installed yt-dlp.");
-    return "yt-dlp";
-  }
-
-  const localYtDlpPath = path.join(tempDir, "yt-dlp");
-  console.log("🔄 Ensuring latest yt-dlp binary is installed...");
-  try {
-    const { execSync } = require("child_process");
-    execSync(`curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${localYtDlpPath}"`, { stdio: "ignore" });
-    execSync(`chmod a+rx "${localYtDlpPath}"`, { stdio: "ignore" });
-    console.log(`✅ Downloaded latest yt-dlp binary to ${localYtDlpPath}`);
-    return localYtDlpPath;
-  } catch (err) {
-    console.error("⚠️ Failed to download latest yt-dlp binary, falling back to system-installed version:", err);
-    return "yt-dlp";
-  }
-}
+const ytDlpPath = process.platform === "win32" 
+  ? path.join(__dirname, ".venv", "Scripts", "yt-dlp.exe") 
+  : path.join(__dirname, ".venv", "bin", "yt-dlp");
 
 // Helper to spawn yt-dlp command safely without shell escaping vulnerability
 function runYtDlp(args) {
@@ -984,7 +965,7 @@ async function startBot() {
 console.log("🤖 Netzee-bot starting…");
 (async () => {
   try {
-    ytDlpPath = await ensureLatestYtDlp();
+    console.log("Using yt-dlp at:", ytDlpPath);
     startQRServer();
     await startBot();
   } catch (err) {
