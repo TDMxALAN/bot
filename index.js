@@ -750,12 +750,13 @@ async function startBot() {
         const parts = text.trim().split(/\s+/);
         if (parts.length < 2) {
           await sock.sendMessage(chatJid, {
-            text: "❌ Usage: *!dp <phone_number>*\nExample: `!dp 94722666467`",
+            text: "❌ Usage: *!dp <phone_number>*\nExamples:\n`!dp 94722666467`\n`!dp +94 72 266 6467`",
           }, { quoted: msg });
           continue;
         }
 
-        const targetPhone = parts[1];
+        // Join everything after the command to support spaced formats like: +94 72 266 6467
+        const targetPhone = parts.slice(1).join("");
         const targetJid = phoneToJid(targetPhone);
 
         console.log(`📸 !dp request from ${chatJid} for ${targetPhone}`);
