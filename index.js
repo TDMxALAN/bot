@@ -26,6 +26,28 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+// Prepopulate YouTube OAuth2 token from environment variable if provided
+function initYoutubeOauth() {
+  if (process.env.YOUTUBE_OAUTH_TOKEN) {
+    try {
+      const tokenData = JSON.parse(process.env.YOUTUBE_OAUTH_TOKEN);
+      const cacheDir = path.join(DATA_DIR, ".yt-dlp-cache");
+      const oauthDir = path.join(cacheDir, "youtube-oauth2");
+      const tokenPath = path.join(oauthDir, "token_data.json");
+
+      if (!fs.existsSync(oauthDir)) {
+        fs.mkdirSync(oauthDir, { recursive: true });
+      }
+
+      fs.writeFileSync(tokenPath, JSON.stringify(tokenData, null, 2), "utf8");
+      console.log("✅ Prepopulated YouTube OAuth2 token from YOUTUBE_OAUTH_TOKEN env variable.");
+    } catch (err) {
+      console.error("⚠️ Failed to parse YOUTUBE_OAUTH_TOKEN env variable. Ensure it is a valid JSON string:", err.message);
+    }
+  }
+}
+initYoutubeOauth();
+
 // Auth session path (survives redeployments when DATA_DIR is a Railway Volume)
 const AUTH_DIR = path.join(DATA_DIR, "auth_info");
 
@@ -675,8 +697,16 @@ async function ensureLatestYtDlp() {
     return "yt-dlp";
   }
 
+  // Prefer the venv-installed yt-dlp (has PO token plugin in the same Python env)
+  const venvYtDlpPath = "/opt/ytdlp-venv/bin/yt-dlp";
+  if (fs.existsSync(venvYtDlpPath)) {
+    console.log(`✅ Using venv yt-dlp with PO token plugin at ${venvYtDlpPath}`);
+    return venvYtDlpPath;
+  }
+
+  // Fallback: download standalone binary (no PO token support)
   const localYtDlpPath = path.join(tempDir, "yt-dlp");
-  console.log("🔄 Ensuring latest yt-dlp binary is installed...");
+  console.log("⚠️ Venv yt-dlp not found. Downloading standalone binary (no PO token support)...");
   try {
     const { execSync } = require("child_process");
     execSync(`curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${localYtDlpPath}"`, { stdio: "ignore" });
@@ -684,7 +714,7 @@ async function ensureLatestYtDlp() {
     console.log(`✅ Downloaded latest yt-dlp binary to ${localYtDlpPath}`);
     return localYtDlpPath;
   } catch (err) {
-    console.error("⚠️ Failed to download latest yt-dlp binary, falling back to system-installed version:", err);
+    console.error("⚠️ Failed to download yt-dlp binary, falling back to system-installed version:", err);
     return "yt-dlp";
   }
 }
