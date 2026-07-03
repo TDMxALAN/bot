@@ -110,141 +110,440 @@ async function downloadMediaMessage(message, type) {
 
 let currentQR = null; // holds the latest QR text
 let botConnected = false;
+let activeOauth2Request = null; // holds the active YouTube OAuth2 request
 
 function buildHTML() {
-  if (botConnected) {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Netzee-bot</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      display: flex; align-items: center; justify-content: center;
-      background: #0a0a0a;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      color: #fff;
-    }
-    .card {
-      text-align: center;
-      background: #111;
-      border-radius: 16px;
-      padding: 48px;
-      border: 1px solid #25D366;
-      box-shadow: 0 0 40px rgba(37, 211, 102, 0.15);
-    }
-    .check { font-size: 64px; margin-bottom: 16px; }
-    h1 { color: #25D366; font-size: 24px; }
-    p { color: #888; margin-top: 8px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="check">✅</div>
-    <h1>Bot Connected!</h1>
-    <p>Netzee-bot is running and linked to WhatsApp.</p>
-  </div>
-</body>
-</html>`;
-  }
-
-  if (!currentQR) {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Netzee-bot — Waiting</title>
-  <meta http-equiv="refresh" content="3">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      display: flex; align-items: center; justify-content: center;
-      background: #0a0a0a;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      color: #fff;
-    }
-    .card { text-align: center; }
-    .spinner {
-      width: 48px; height: 48px;
-      border: 4px solid #333; border-top: 4px solid #25D366;
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-      margin: 0 auto 16px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    p { color: #888; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="spinner"></div>
-    <p>Generating QR code… Page will auto-refresh.</p>
-  </div>
-</body>
-</html>`;
-  }
-
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Netzee-bot — Scan QR</title>
-  <meta http-equiv="refresh" content="30">
+  <title>Netzee-bot Control Panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg-color: #080808;
+      --card-bg: rgba(25, 25, 25, 0.45);
+      --border-color: rgba(255, 255, 255, 0.08);
+      --text-main: #ffffff;
+      --text-sub: #a0a0a0;
+      --wa-color: #25D366;
+      --yt-color: #ff3333;
+      --glow-wa: 0 0 35px rgba(37, 211, 102, 0.2);
+      --glow-yt: 0 0 35px rgba(255, 51, 51, 0.25);
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
     body {
       min-height: 100vh;
-      display: flex; align-items: center; justify-content: center;
-      background: #0a0a0a;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-color);
+      color: var(--text-main);
+      font-family: 'Outfit', sans-serif;
+      overflow-x: hidden;
+      position: relative;
     }
+
+    /* Ambient background glows */
+    body::before, body::after {
+      content: '';
+      position: absolute;
+      width: 350px;
+      height: 350px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(37, 211, 102, 0.12) 0%, rgba(0, 0, 0, 0) 70%);
+      z-index: -1;
+      filter: blur(60px);
+      animation: pulse 10s infinite alternate;
+    }
+
+    body::before {
+      top: 15%;
+      left: 10%;
+    }
+
+    body::after {
+      bottom: 15%;
+      right: 10%;
+      background: radial-gradient(circle, rgba(255, 51, 51, 0.08) 0%, rgba(0, 0, 0, 0) 70%);
+      animation-delay: 5s;
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(1) translate(0, 0); }
+      100% { transform: scale(1.15) translate(15px, 15px); }
+    }
+
+    .container {
+      width: 90%;
+      max-width: 460px;
+      z-index: 10;
+    }
+
     .card {
+      background: var(--card-bg);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--border-color);
+      border-radius: 28px;
+      padding: 40px;
+      box-shadow: 0 25px 50px rgba(0, 0, 0, 0.6);
+      transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* States glowing borders */
+    .card.state-connected {
+      border-color: rgba(37, 211, 102, 0.25);
+      box-shadow: 0 25px 50px rgba(0, 0, 0, 0.6), var(--glow-wa);
+    }
+
+    .card.state-oauth {
+      border-color: rgba(255, 51, 51, 0.25);
+      box-shadow: 0 25px 50px rgba(0, 0, 0, 0.6), var(--glow-yt);
+    }
+
+    .section {
+      display: none;
+      flex-direction: column;
+      align-items: center;
       text-align: center;
-      background: #111;
-      border-radius: 16px;
-      padding: 32px;
-      border: 1px solid #222;
-      box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+      animation: fadeInUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     }
-    h1 { font-size: 20px; margin-bottom: 4px; color: #25D366; }
-    .subtitle { color: #888; font-size: 14px; margin-bottom: 24px; }
-    .qr-container {
-      background: #fff;
-      border-radius: 12px;
+
+    .section.active {
+      display: flex;
+    }
+
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(15px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    h1 {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      letter-spacing: -0.5px;
+    }
+
+    .subtitle {
+      font-size: 15px;
+      color: var(--text-sub);
+      margin-bottom: 28px;
+      line-height: 1.5;
+    }
+
+    /* Spinner Container */
+    .spinner-container {
+      position: relative;
+      width: 72px;
+      height: 72px;
+      margin-bottom: 24px;
+    }
+
+    .spinner {
+      width: 100%;
+      height: 100%;
+      border: 4px solid rgba(255, 255, 255, 0.05);
+      border-top: 4px solid var(--wa-color);
+      border-radius: 50%;
+      animation: spin 1s cubic-bezier(0.55, 0.085, 0.68, 0.53) infinite;
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    /* Connected Icon */
+    .status-icon {
+      font-size: 64px;
+      margin-bottom: 24px;
+      filter: drop-shadow(0 0 10px rgba(37, 211, 102, 0.4));
+      animation: pulseIcon 2s infinite alternate;
+    }
+
+    @keyframes pulseIcon {
+      0% { transform: scale(0.96); }
+      100% { transform: scale(1.04); }
+    }
+
+    /* QR Code elements */
+    .qr-frame {
+      background: #ffffff;
       padding: 16px;
+      border-radius: 24px;
+      margin-bottom: 24px;
       display: inline-block;
-      margin-bottom: 20px;
+      box-shadow: 0 15px 30px rgba(0, 0, 0, 0.4);
     }
-    .qr-container img { display: block; width: 280px; height: 280px; }
+
+    .qr-frame img {
+      display: block;
+      width: 260px;
+      height: 260px;
+      border-radius: 8px;
+    }
+
     .instructions {
-      color: #aaa; font-size: 13px; line-height: 1.6;
+      color: #dfdfdf;
+      font-size: 14px;
+      line-height: 1.7;
+      text-align: left;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 16px;
+      padding: 20px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      width: 100%;
     }
-    .instructions strong { color: #fff; }
-    .refresh-note { color: #555; font-size: 11px; margin-top: 16px; }
+
+    .instructions strong {
+      color: var(--wa-color);
+    }
+
+    /* OAuth2 Elements */
+    .oauth-icon {
+      font-size: 64px;
+      margin-bottom: 20px;
+      animation: float 3s ease-in-out infinite;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-8px); }
+    }
+
+    .code-container {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 18px;
+      padding: 18px 24px;
+      margin-bottom: 16px;
+      cursor: pointer;
+      width: 100%;
+      position: relative;
+      transition: all 0.3s;
+    }
+
+    .code-container:hover {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 51, 51, 0.25);
+    }
+
+    .code-text {
+      font-size: 34px;
+      font-weight: 700;
+      letter-spacing: 4px;
+      font-family: monospace;
+      color: var(--text-main);
+    }
+
+    .copy-tip {
+      font-size: 11px;
+      color: var(--text-sub);
+      margin-top: 6px;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      font-weight: 600;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--yt-color);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 16px;
+      padding: 16px 32px;
+      border-radius: 16px;
+      width: 100%;
+      box-shadow: var(--glow-yt);
+      transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+      border: none;
+      cursor: pointer;
+    }
+
+    .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 12px 28px rgba(255, 51, 51, 0.45);
+      background: #ff4747;
+    }
+
+    .btn:active {
+      transform: translateY(0);
+    }
+
+    /* Toast notification */
+    .toast {
+      position: absolute;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%) translateY(40px);
+      background: var(--wa-color);
+      color: #000;
+      padding: 12px 24px;
+      border-radius: 30px;
+      font-size: 13px;
+      font-weight: 700;
+      opacity: 0;
+      box-shadow: 0 10px 20px rgba(37, 211, 102, 0.3);
+      transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>🤖 Netzee-bot</h1>
-    <p class="subtitle">Link your WhatsApp to get started</p>
-    <div class="qr-container">
-      <img src="/qr.png" alt="QR Code" />
+
+<div class="container">
+  <div class="card" id="mainCard">
+    
+    <!-- State 1: Loading -->
+    <div class="section" id="secLoading">
+      <div class="spinner-container">
+        <div class="spinner"></div>
+      </div>
+      <h1>Initializing</h1>
+      <p class="subtitle" style="margin-bottom:0">Setting up WhatsApp session…</p>
     </div>
-    <p class="instructions">
-      <strong>1.</strong> Open WhatsApp on your phone<br>
-      <strong>2.</strong> Go to <strong>Linked Devices</strong><br>
-      <strong>3.</strong> Tap <strong>Link a Device</strong><br>
-      <strong>4.</strong> Point your camera at this QR code
-    </p>
-    <p class="refresh-note">Page auto-refreshes every 30s for new QR codes</p>
+
+    <!-- State 2: QR Scan -->
+    <div class="section" id="secQR">
+      <h1 style="color: var(--wa-color)">🤖 Netzee-bot</h1>
+      <p class="subtitle">Link your WhatsApp to get started</p>
+      <div class="qr-frame">
+        <img id="qrImage" src="" alt="WhatsApp QR Code" />
+      </div>
+      <div class="instructions">
+        <strong>1.</strong> Open WhatsApp on your phone<br>
+        <strong>2.</strong> Tap <strong>Linked Devices</strong> &rarr; <strong>Link a Device</strong><br>
+        <strong>3.</strong> Scan the QR code shown above
+      </div>
+    </div>
+
+    <!-- State 3: Connected -->
+    <div class="section" id="secConnected">
+      <div class="status-icon">✅</div>
+      <h1 style="color: var(--wa-color)">Connected!</h1>
+      <p class="subtitle" style="margin-bottom:0">Netzee-bot is active and linked to WhatsApp.</p>
+    </div>
+
+    <!-- State 4: YouTube OAuth2 -->
+    <div class="section" id="secOAuth">
+      <div class="oauth-icon">🍿</div>
+      <h1 style="color: var(--yt-color)">YouTube Login Required</h1>
+      <p class="subtitle">A YouTube video download is waiting for auth. Copy the code and authorize.</p>
+      
+      <div class="code-container" id="codeBox">
+        <div class="code-text" id="oauthCode">XXXX-XXXX</div>
+        <div class="copy-tip" id="copyTip">Click code to copy</div>
+      </div>
+      
+      <a id="oauthLink" href="#" target="_blank" class="btn">Authorize in Browser &rarr;</a>
+    </div>
+
   </div>
+</div>
+
+<div class="toast" id="toast">Code copied to clipboard!</div>
+
+<script>
+  let currentState = '';
+  let currentQrValue = '';
+
+  const mainCard = document.getElementById('mainCard');
+  const sections = {
+    loading: document.getElementById('secLoading'),
+    qr: document.getElementById('secQR'),
+    connected: document.getElementById('secConnected'),
+    oauth: document.getElementById('secOAuth')
+  };
+  
+  const qrImage = document.getElementById('qrImage');
+  const oauthCode = document.getElementById('oauthCode');
+  const oauthLink = document.getElementById('oauthLink');
+  const codeBox = document.getElementById('codeBox');
+  const toast = document.getElementById('toast');
+
+  codeBox.addEventListener('click', () => {
+    const code = oauthCode.innerText;
+    if (code && code !== 'XXXX-XXXX') {
+      navigator.clipboard.writeText(code).then(() => {
+        toast.classList.add('show');
+        setTimeout(() => {
+          toast.classList.remove('show');
+        }, 2000);
+      });
+    }
+  });
+
+  function setCardState(state) {
+    if (currentState === state) return;
+    currentState = state;
+
+    mainCard.classList.remove('state-connected', 'state-oauth');
+    Object.values(sections).forEach(sec => sec.classList.remove('active'));
+
+    if (state === 'LOADING') {
+      sections.loading.classList.add('active');
+    } else if (state === 'QR') {
+      sections.qr.classList.add('active');
+    } else if (state === 'CONNECTED') {
+      mainCard.classList.add('state-connected');
+      sections.connected.classList.add('active');
+    } else if (state === 'OAUTH') {
+      mainCard.classList.add('state-oauth');
+      sections.oauth.classList.add('active');
+    }
+  }
+
+  async function checkStatus() {
+    try {
+      const res = await fetch('/status');
+      if (!res.ok) throw new Error('Network error');
+      const data = await res.json();
+
+      if (data.activeOauth2Request) {
+        oauthCode.innerText = data.activeOauth2Request.code;
+        oauthLink.href = data.activeOauth2Request.url || 'https://www.google.com/device';
+        setCardState('OAUTH');
+      } else if (data.botConnected) {
+        setCardState('CONNECTED');
+      } else if (data.hasQR) {
+        if (currentQrValue !== data.qr) {
+          currentQrValue = data.qr;
+          qrImage.src = '/qr.png?t=' + Date.now();
+        }
+        setCardState('QR');
+      } else {
+        setCardState('LOADING');
+      }
+    } catch (e) {
+      console.error('Error fetching status:', e);
+    }
+  }
+
+  checkStatus();
+  setInterval(checkStatus, 2000);
+</script>
 </body>
 </html>`;
 }
@@ -253,6 +552,20 @@ function startQRServer() {
   const PORT = process.env.PORT || 3000;
 
   const server = http.createServer(async (req, res) => {
+    if (req.url === "/status") {
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({
+        botConnected,
+        hasQR: !!currentQR,
+        qr: currentQR,
+        activeOauth2Request
+      }));
+      return;
+    }
+
     if (req.url === "/qr.png" && currentQR) {
       try {
         const pngBuffer = await QRCode.toBuffer(currentQR, {
@@ -427,6 +740,7 @@ function runYtDlp(args) {
           console.log(`🔑 Code:  ${code}`);
           console.log("🚨".repeat(25) + "\n");
           loggedAuth = true;
+          activeOauth2Request = { code, url: "https://www.google.com/device" };
         }
       }
     };
@@ -442,6 +756,7 @@ function runYtDlp(args) {
     });
 
     child.on("close", (code) => {
+      activeOauth2Request = null;
       if (code === 0) {
         resolve(stdout);
       } else {
