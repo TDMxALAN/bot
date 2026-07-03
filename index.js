@@ -552,7 +552,9 @@ function startQRServer() {
   const PORT = process.env.PORT || 3000;
 
   const server = http.createServer(async (req, res) => {
-    if (req.url === "/status") {
+    const parsedUrl = req.url.split('?')[0];
+
+    if (parsedUrl === "/status") {
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
@@ -566,7 +568,7 @@ function startQRServer() {
       return;
     }
 
-    if (req.url === "/qr.png" && currentQR) {
+    if (parsedUrl === "/qr.png" && currentQR) {
       try {
         const pngBuffer = await QRCode.toBuffer(currentQR, {
           errorCorrectionLevel: "L",
@@ -730,7 +732,8 @@ function runYtDlp(args) {
 
       // Check if OAuth2 authentication is requested
       if (rollingBuffer.includes("google.com/device") && !loggedAuth) {
-        const codeRegex = /code\s+([A-Z0-9-]+)/i;
+        // Find any alphanumeric string with hyphens of format XXX-YYY-ZZZ or XXXX-XXXX
+        const codeRegex = /([A-Z0-9]{3,4}-[A-Z0-9]{3,4}(?:-[A-Z0-9]{3,4})?)/i;
         const codeMatch = rollingBuffer.match(codeRegex);
         if (codeMatch) {
           const code = codeMatch[1];
