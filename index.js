@@ -377,16 +377,68 @@ async function ensureLatestYtDlp() {
 // Helper to spawn yt-dlp command safely without shell escaping vulnerability
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(ytDlpPath, args);
+    const finalArgs = [...args];
+
+    // Determine if this is a YouTube download
+    const isYouTube = args.some(arg => 
+      typeof arg === "string" && 
+      (arg.includes("youtube.com") || arg.includes("youtu.be"))
+    );
+
+    // Ensure we use a persistent cache directory for tokens
+    const cacheDir = path.join(DATA_DIR, ".yt-dlp-cache");
+    if (!fs.existsSync(cacheDir)) {
+      fs.mkdirSync(cacheDir, { recursive: true });
+    }
+    finalArgs.push("--cache-dir", cacheDir);
+
+    // If YouTube, append the OAuth2 authentication arguments
+    if (isYouTube) {
+      finalArgs.push("--username", "oauth2", "--password", "");
+    }
+
+    console.log(`ℹ️ Spawning yt-dlp with args: ${finalArgs.join(" ")}`);
+
+    const child = spawn(ytDlpPath, finalArgs);
     let stdout = "";
     let stderr = "";
+    let loggedAuth = false;
+    let rollingBuffer = "";
+
+    const handleData = (data) => {
+      const text = data.toString();
+      // Write to console in real-time so logs show in Railway
+      process.stdout.write(text);
+
+      rollingBuffer += text;
+      if (rollingBuffer.length > 2000) {
+        rollingBuffer = rollingBuffer.slice(-1000);
+      }
+
+      // Check if OAuth2 authentication is requested
+      if (rollingBuffer.includes("google.com/device") && !loggedAuth) {
+        const codeRegex = /code\s+([A-Z0-9-]+)/i;
+        const codeMatch = rollingBuffer.match(codeRegex);
+        if (codeMatch) {
+          const code = codeMatch[1];
+          console.log("\n" + "🚨".repeat(25));
+          console.log("📢 YOUTUBE OAUTH2 AUTHENTICATION REQUIRED");
+          console.log("👉 Go to: https://www.google.com/device");
+          console.log(`🔑 Code:  ${code}`);
+          console.log("🚨".repeat(25) + "\n");
+          loggedAuth = true;
+        }
+      }
+    };
 
     child.stdout.on("data", (data) => {
       stdout += data.toString();
+      handleData(data);
     });
 
     child.stderr.on("data", (data) => {
       stderr += data.toString();
+      handleData(data);
     });
 
     child.on("close", (code) => {
