@@ -13,6 +13,22 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
+// ──────────────────────────────────────────────
+// Persistent data directory
+// On Railway: set the AUTH_DIR environment variable to the Volume mount path (e.g. /data).
+// Locally: falls back to the project directory so nothing breaks.
+// ──────────────────────────────────────────────
+const DATA_DIR = process.env.AUTH_DIR
+  ? path.resolve(process.env.AUTH_DIR)
+  : __dirname;
+
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+// Auth session path (survives redeployments when DATA_DIR is a Railway Volume)
+const AUTH_DIR = path.join(DATA_DIR, "auth_info");
+
 // Ensure temp directory exists
 const tempDir = path.join(__dirname, "temp");
 if (!fs.existsSync(tempDir)) {
@@ -20,10 +36,10 @@ if (!fs.existsSync(tempDir)) {
 }
 
 // Watchlist storage path
-const WATCHLIST_FILE = path.join(__dirname, "watchlist.json");
+const WATCHLIST_FILE = path.join(DATA_DIR, "watchlist.json");
 
 // Callblocking storage path
-const CALLBLOCKING_FILE = path.join(__dirname, "callblocking.json");
+const CALLBLOCKING_FILE = path.join(DATA_DIR, "callblocking.json");
 
 // Active YouTube download requests mapping (messageId -> { url, requesterJid })
 const activeYtRequests = new Map();
@@ -428,7 +444,7 @@ async function checkProfilePictures(sock, watchlist) {
 // ──────────────────────────────────────────────
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   const logger = pino({ level: "silent" });
@@ -478,7 +494,7 @@ async function startBot() {
       }
 
       if (statusCode === DisconnectReason.loggedOut) {
-        console.log("❌ Session logged out. Delete auth_info/ and restart.");
+        console.log(`❌ Session logged out. Delete ${AUTH_DIR}/ and restart.`);
         process.exit(1);
       }
 
