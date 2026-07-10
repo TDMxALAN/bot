@@ -18,8 +18,9 @@ const { spawn } = require("child_process");
 // On Railway: set the AUTH_DIR environment variable to the Volume mount path (e.g. /data).
 // Locally: falls back to the project directory so nothing breaks.
 // ──────────────────────────────────────────────
-const DATA_DIR = process.env.AUTH_DIR
-  ? path.resolve(process.env.AUTH_DIR)
+const mountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.AUTH_DIR || process.env.DATA_DIR;
+const DATA_DIR = mountPath
+  ? path.resolve(mountPath)
   : __dirname;
 
 if (!fs.existsSync(DATA_DIR)) {
