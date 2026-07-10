@@ -688,6 +688,7 @@ async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
   throw lastError || new Error("All Cobalt instances failed");
 }
 
+
 let ytDlpPath = "yt-dlp";
 
 async function ensureLatestYtDlp() {
@@ -718,6 +719,7 @@ async function ensureLatestYtDlp() {
     return "yt-dlp";
   }
 }
+
 
 // Helper to spawn yt-dlp command safely without shell escaping vulnerability
 function runYtDlp(args) {
@@ -1654,7 +1656,7 @@ async function startBot() {
 console.log("🤖 Netzee-bot starting…");
 (async () => {
   try {
-    ytDlpPath = await ensureLatestYtDlp();
+    console.log("Using yt-dlp at:", ytDlpPath);
     startQRServer();
     await startBot();
   } catch (err) {
