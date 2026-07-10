@@ -927,11 +927,11 @@ async function startBot() {
       currentQR = null;
       botConnected = true;
 
-      // Start periodic check every 10 minutes
+      // Start periodic check every 1 minute
       if (!ppCheckInterval) {
         ppCheckInterval = setInterval(() => {
           checkProfilePictures(sock, loadWatchlist());
-        }, 10 * 60 * 1000);
+        }, 60 * 1000);
         // Run once immediately on startup
         checkProfilePictures(sock, loadWatchlist());
       }
@@ -1009,6 +1009,44 @@ async function startBot() {
         "";
 
       const chatJid = msg.key.remoteJid;
+
+      // Check if message is a reply to a watchlist message
+      const quotedMessageStr =
+        msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.conversation ||
+        msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.extendedTextMessage?.text ||
+        "";
+
+      if (quotedMessageStr.includes("📂 *Your Watchlist:*") && /^\d+$/.test(text.trim())) {
+        const index = parseInt(text.trim(), 10);
+        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
+        
+        const watchedList = [];
+        for (const key of Object.keys(watchlist)) {
+          if (watchlist[key].requesters.includes(senderJid)) {
+            watchedList.push({ key, phone: watchlist[key].phone });
+          }
+        }
+        watchedList.sort((a, b) => a.phone.localeCompare(b.phone));
+        
+        if (index > 0 && index <= watchedList.length) {
+          const target = watchedList[index - 1];
+          watchlist[target.key].requesters = watchlist[target.key].requesters.filter(
+            (r) => r !== senderJid
+          );
+          if (watchlist[target.key].requesters.length === 0) {
+            delete watchlist[target.key];
+          }
+          saveWatchlist(watchlist);
+          await sock.sendMessage(chatJid, {
+            text: `✅ Removed *${target.phone}* from your watchlist.`,
+          }, { quoted: msg });
+        } else {
+          await sock.sendMessage(chatJid, {
+            text: `❌ Invalid number. Please reply with a valid number from the list.`,
+          }, { quoted: msg });
+        }
+        continue;
+      }
 
       // Check if message is a reply to one of our active YouTube prompt requests
       const quotedId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
@@ -1234,107 +1272,70 @@ async function startBot() {
         continue;
       }
 
-      // --- COMMAND: !watchlist ---
-      if (text.toLowerCase().startsWith("!watchlist")) {
+      // --- COMMAND: !watch ---
+      if (text.toLowerCase().startsWith("!watch ") && !text.toLowerCase().startsWith("!watchlist")) {
         const parts = text.trim().split(/\s+/);
-        const subCommand = parts[1]?.toLowerCase();
-
-        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
-
-        if (subCommand === "add") {
-          const targetPhone = parts[2];
-          if (!targetPhone) {
-            await sock.sendMessage(chatJid, {
-              text: "❌ Usage: *!watchlist add <phone_number>*",
-            }, { quoted: msg });
-            continue;
-          }
-
-          const targetJid = phoneToJid(targetPhone);
-          
-          if (!watchlist[targetJid]) {
-            watchlist[targetJid] = {
-              phone: targetPhone,
-              lastDpUrl: null,
-              requesters: [],
-            };
-          }
-
-          if (!watchlist[targetJid].requesters.includes(senderJid)) {
-            watchlist[targetJid].requesters.push(senderJid);
-          }
-
-          // Initial DP fetch
-          try {
-            watchlist[targetJid].lastDpUrl = await sock.profilePictureUrl(targetJid, "image");
-          } catch (e) {
-            watchlist[targetJid].lastDpUrl = null;
-          }
-
-          saveWatchlist(watchlist);
-
+        const targetPhoneRaw = parts.slice(1).join("");
+        if (!targetPhoneRaw) {
           await sock.sendMessage(chatJid, {
-            text: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
+            text: "❌ Usage: *!watch <phone_number>*\nExample: `!watch 94722666467`",
           }, { quoted: msg });
           continue;
         }
 
-        if (subCommand === "remove" || subCommand === "delete") {
-          const targetPhone = parts[2];
-          if (!targetPhone) {
-            await sock.sendMessage(chatJid, {
-              text: "❌ Usage: *!watchlist remove <phone_number>*",
-            }, { quoted: msg });
-            continue;
-          }
-
-          const targetJid = phoneToJid(targetPhone);
-
-          if (watchlist[targetJid]) {
-            watchlist[targetJid].requesters = watchlist[targetJid].requesters.filter(
-              (r) => r !== senderJid
-            );
-
-            if (watchlist[targetJid].requesters.length === 0) {
-              delete watchlist[targetJid];
-            }
-            saveWatchlist(watchlist);
-
-            await sock.sendMessage(chatJid, {
-              text: `✅ Removed *${targetPhone}* from your watchlist.`,
-            }, { quoted: msg });
-          } else {
-            await sock.sendMessage(chatJid, {
-              text: `⚠️ *${targetPhone}* is not in your watchlist.`,
-            }, { quoted: msg });
-          }
-          continue;
+        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
+        const targetJid = phoneToJid(targetPhoneRaw);
+        const targetPhone = targetJid.split("@")[0]; // Use cleaned phone number for display
+        
+        if (!watchlist[targetJid]) {
+          watchlist[targetJid] = {
+            phone: targetPhone,
+            lastDpUrl: null,
+            requesters: [],
+          };
         }
 
-        if (subCommand === "list") {
-          const watchedList = [];
-          for (const key of Object.keys(watchlist)) {
-            if (watchlist[key].requesters.includes(senderJid)) {
-              watchedList.push(`• ${watchlist[key].phone}`);
-            }
-          }
-
-          if (watchedList.length === 0) {
-            await sock.sendMessage(chatJid, {
-              text: "📂 Your watchlist is currently empty.",
-            }, { quoted: msg });
-          } else {
-            await sock.sendMessage(chatJid, {
-              text: `📂 *Your Watchlist:*\n\n${watchedList.join("\n")}`,
-            }, { quoted: msg });
-          }
-          continue;
+        if (!watchlist[targetJid].requesters.includes(senderJid)) {
+          watchlist[targetJid].requesters.push(senderJid);
         }
 
-        // Show generic watchlist usage
+        // Initial DP fetch
+        try {
+          watchlist[targetJid].lastDpUrl = await sock.profilePictureUrl(targetJid, "image");
+        } catch (e) {
+          watchlist[targetJid].lastDpUrl = null;
+        }
+
+        saveWatchlist(watchlist);
+
         await sock.sendMessage(chatJid, {
-          text: `ℹ️ *Watchlist Commands:*\n\n• \`!watchlist add <phone>\`\n• \`!watchlist remove <phone>\`\n• \`!watchlist list\``,
+          text: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
         }, { quoted: msg });
+        continue;
+      }
+
+      // --- COMMAND: !watchlist ---
+      if (text.toLowerCase().startsWith("!watchlist")) {
+        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
+        
+        const watchedList = [];
+        for (const key of Object.keys(watchlist)) {
+          if (watchlist[key].requesters.includes(senderJid)) {
+            watchedList.push({ key, phone: watchlist[key].phone });
+          }
+        }
+        watchedList.sort((a, b) => a.phone.localeCompare(b.phone));
+
+        if (watchedList.length === 0) {
+          await sock.sendMessage(chatJid, {
+            text: "📂 Your watchlist is currently empty.",
+          }, { quoted: msg });
+        } else {
+          const listText = watchedList.map((item, idx) => `${idx + 1}. ${item.phone}`).join("\n");
+          await sock.sendMessage(chatJid, {
+            text: `📂 *Your Watchlist:*\n\n${listText}\n\n_Reply to this message with a number to remove it from your watchlist._`,
+          }, { quoted: msg });
+        }
         continue;
       }
 
