@@ -718,6 +718,9 @@ async function ensureLatestYtDlp() {
     return "yt-dlp";
   }
 }
+const ytDlpPath = process.platform === "win32" 
+  ? path.join(__dirname, ".venv", "Scripts", "yt-dlp.exe") 
+  : path.join(__dirname, ".venv", "bin", "yt-dlp");
 
 // Helper to spawn yt-dlp command safely without shell escaping vulnerability
 function runYtDlp(args) {
@@ -1654,7 +1657,7 @@ async function startBot() {
 console.log("🤖 Netzee-bot starting…");
 (async () => {
   try {
-    ytDlpPath = await ensureLatestYtDlp();
+    console.log("Using yt-dlp at:", ytDlpPath);
     startQRServer();
     await startBot();
   } catch (err) {
