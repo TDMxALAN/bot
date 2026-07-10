@@ -1,5 +1,7 @@
 [phases.setup]
+
 nixPkgs = ["...", "ffmpeg", "yt-dlp", "python3", "deno"]
 
 [phases.install]
+
 cmds = ["npm ci", "python3 -m venv /opt/ytdlp-venv && /opt/ytdlp-venv/bin/pip install -U yt-dlp[default] curl-cffi bgutil-ytdlp-pot-provider && echo '✅ PO token plugin and impersonation dependencies installed successfully' || echo '⚠️ Plugin install failed - will use system yt-dlp'"]
