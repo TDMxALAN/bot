@@ -5,7 +5,10 @@ const {
   fetchLatestBaileysVersion,
   downloadContentFromMessage,
   jidNormalizedUser,
+  initAuthCreds,
+  BufferJSON,
 } = require("@whiskeysockets/baileys");
+const { MongoClient } = require('mongodb');
 const pino = require("pino");
 const QRCode = require("qrcode");
 const http = require("http");
@@ -862,11 +865,75 @@ async function checkProfilePictures(sock, watchlist) {
 }
 
 // ──────────────────────────────────────────────
+// MongoDB Auth State Adapter
+// ──────────────────────────────────────────────
+async function useMongoDBAuthState(collection) {
+    const writeData = async (data, id) => {
+        await collection.replaceOne({ _id: id }, JSON.parse(JSON.stringify(data, BufferJSON.replacer, 2)), { upsert: true });
+    };
+    
+    const readData = async (id) => {
+        const data = await collection.findOne({ _id: id });
+        if (data) return JSON.parse(JSON.stringify(data), BufferJSON.reviver);
+        return null;
+    };
+
+    const creds = await readData('creds') || initAuthCreds();
+    
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    await Promise.all(ids.map(async id => {
+                        let value = await readData(`${type}-${id}`);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = Buffer.from(value.data, 'base64');
+                        }
+                        data[id] = value;
+                    }));
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            tasks.push(value ? writeData(value, key) : collection.deleteOne({ _id: key }));
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: () => writeData(creds, 'creds')
+    };
+}
+
+// ──────────────────────────────────────────────
 // Bot
 // ──────────────────────────────────────────────
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  let state, saveCreds;
+
+  if (process.env.MONGODB_URI) {
+    console.log("🍃 Using MongoDB for auth state...");
+    const mongoClient = new MongoClient(process.env.MONGODB_URI);
+    await mongoClient.connect();
+    const collection = mongoClient.db("whatsapp-bot").collection("auth_info");
+    const authInfo = await useMongoDBAuthState(collection);
+    state = authInfo.state;
+    saveCreds = authInfo.saveCreds;
+  } else {
+    console.log("📁 Using local file system for auth state...");
+    const authInfo = await useMultiFileAuthState(AUTH_DIR);
+    state = authInfo.state;
+    saveCreds = authInfo.saveCreds;
+  }
+
   const { version } = await fetchLatestBaileysVersion();
 
   const logger = pino({ level: "silent" });
