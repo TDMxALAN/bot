@@ -621,7 +621,7 @@ function startQRServer() {
     res.end(buildHTML());
   });
 
-  server.listen(PORT, () => {
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 QR web server running on port ${PORT}`);
     console.log(`   Open your Northflank public URL to scan the QR code`);
   });
