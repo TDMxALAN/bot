@@ -20,8 +20,8 @@ WORKDIR /app
 # Copy package.json and package-lock.json
 COPY package*.json ./
 
-# Install npm dependencies
-RUN npm ci
+# Install npm dependencies without triggering the postinstall script
+RUN npm ci --ignore-scripts
 
 # Create a virtual environment and install yt-dlp and its plugins
 RUN python3 -m venv /opt/ytdlp-venv && \
