@@ -983,8 +983,15 @@ async function startBot() {
       }
 
       if (statusCode === DisconnectReason.loggedOut) {
-        console.log(`❌ Session logged out. Delete ${AUTH_DIR}/ and restart.`);
-        process.exit(1);
+        console.log(`❌ Session logged out. Clearing ${AUTH_DIR}/ and restarting...`);
+        try {
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        } catch (e) {
+          console.error("Failed to delete AUTH_DIR:", e);
+        }
+        botConnected = false;
+        setTimeout(startBot, 3000);
+        return;
       }
 
       console.log(`⚠️  Connection closed (code ${statusCode}). Reconnecting…`);
