@@ -18,10 +18,10 @@ const { spawn } = require("child_process");
 
 // ──────────────────────────────────────────────
 // Persistent data directory
-// On Railway: set the AUTH_DIR environment variable to the Volume mount path (e.g. /data).
-// Locally: falls back to the project directory so nothing breaks.
-// ──────────────────────────────────────────────
-const mountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.AUTH_DIR || process.env.DATA_DIR;
+// On Northflank: set the AUTH_DIR environment variable to the Volume mount path (e.g. /data).
+// Fallback: Railway uses RAILWAY_VOLUME_MOUNT_PATH.
+// If neither is set, we will use a local folder.
+const mountPath = process.env.NORTHFLANK_VOLUME_MOUNT_PATH || process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.AUTH_DIR || process.env.DATA_DIR;
 const DATA_DIR = mountPath
   ? path.resolve(mountPath)
   : __dirname;
@@ -52,7 +52,7 @@ function initYoutubeOauth() {
 }
 initYoutubeOauth();
 
-// Auth session path (survives redeployments when DATA_DIR is a Railway Volume)
+// Auth session path (survives redeployments when DATA_DIR is a Northflank Volume)
 const AUTH_DIR = path.join(DATA_DIR, "auth_info");
 
 // Ensure temp directory exists
@@ -623,7 +623,7 @@ function startQRServer() {
 
   server.listen(PORT, () => {
     console.log(`🌐 QR web server running on port ${PORT}`);
-    console.log(`   Open your Railway public URL to scan the QR code`);
+    console.log(`   Open your Northflank public URL to scan the QR code`);
   });
 }
 
@@ -758,7 +758,7 @@ function runYtDlp(args) {
 
     const handleData = (data) => {
       const text = data.toString();
-      // Write to console in real-time so logs show in Railway
+      // Write to console in real-time so logs show in Northflank
       process.stdout.write(text);
 
       rollingBuffer += text;
@@ -971,7 +971,7 @@ async function startBot() {
     if (qr) {
       currentQR = qr;
       botConnected = false;
-      console.log("📱 New QR code generated — open your Railway URL to scan it");
+      console.log("📱 New QR code generated — open your Northflank URL to scan it");
     }
 
     if (connection === "close") {
