@@ -5,10 +5,7 @@ const {
   fetchLatestBaileysVersion,
   downloadContentFromMessage,
   jidNormalizedUser,
-  initAuthCreds,
-  BufferJSON,
 } = require("@whiskeysockets/baileys");
-const { MongoClient } = require('mongodb');
 const pino = require("pino");
 const QRCode = require("qrcode");
 const http = require("http");
@@ -18,10 +15,10 @@ const { spawn } = require("child_process");
 
 // ──────────────────────────────────────────────
 // Persistent data directory
-// On Northflank: set the AUTH_DIR environment variable to the Volume mount path (e.g. /data).
-// Fallback: Railway uses RAILWAY_VOLUME_MOUNT_PATH.
-// If neither is set, we will use a local folder.
-const mountPath = process.env.NORTHFLANK_VOLUME_MOUNT_PATH || process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.AUTH_DIR || process.env.DATA_DIR;
+// On Railway: set the AUTH_DIR environment variable to the Volume mount path (e.g. /data).
+// Locally: falls back to the project directory so nothing breaks.
+// ──────────────────────────────────────────────
+const mountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.env.AUTH_DIR || process.env.DATA_DIR;
 const DATA_DIR = mountPath
   ? path.resolve(mountPath)
   : __dirname;
@@ -52,7 +49,7 @@ function initYoutubeOauth() {
 }
 initYoutubeOauth();
 
-// Auth session path (survives redeployments when DATA_DIR is a Northflank Volume)
+// Auth session path (survives redeployments when DATA_DIR is a Railway Volume)
 const AUTH_DIR = path.join(DATA_DIR, "auth_info");
 
 // Ensure temp directory exists
@@ -621,9 +618,9 @@ function startQRServer() {
     res.end(buildHTML());
   });
 
-  server.listen(PORT, '0.0.0.0', () => {
+  server.listen(PORT, () => {
     console.log(`🌐 QR web server running on port ${PORT}`);
-    console.log(`   Open your Northflank public URL to scan the QR code`);
+    console.log(`   Open your Railway public URL to scan the QR code`);
   });
 }
 
@@ -758,7 +755,7 @@ function runYtDlp(args) {
 
     const handleData = (data) => {
       const text = data.toString();
-      // Write to console in real-time so logs show in Northflank
+      // Write to console in real-time so logs show in Railway
       process.stdout.write(text);
 
       rollingBuffer += text;
@@ -865,75 +862,11 @@ async function checkProfilePictures(sock, watchlist) {
 }
 
 // ──────────────────────────────────────────────
-// MongoDB Auth State Adapter
-// ──────────────────────────────────────────────
-async function useMongoDBAuthState(collection) {
-    const writeData = async (data, id) => {
-        await collection.replaceOne({ _id: id }, JSON.parse(JSON.stringify(data, BufferJSON.replacer, 2)), { upsert: true });
-    };
-    
-    const readData = async (id) => {
-        const data = await collection.findOne({ _id: id });
-        if (data) return JSON.parse(JSON.stringify(data), BufferJSON.reviver);
-        return null;
-    };
-
-    const creds = await readData('creds') || initAuthCreds();
-    
-    return {
-        state: {
-            creds,
-            keys: {
-                get: async (type, ids) => {
-                    const data = {};
-                    await Promise.all(ids.map(async id => {
-                        let value = await readData(`${type}-${id}`);
-                        if (type === 'app-state-sync-key' && value) {
-                            value = Buffer.from(value.data, 'base64');
-                        }
-                        data[id] = value;
-                    }));
-                    return data;
-                },
-                set: async (data) => {
-                    const tasks = [];
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const key = `${category}-${id}`;
-                            tasks.push(value ? writeData(value, key) : collection.deleteOne({ _id: key }));
-                        }
-                    }
-                    await Promise.all(tasks);
-                }
-            }
-        },
-        saveCreds: () => writeData(creds, 'creds')
-    };
-}
-
-// ──────────────────────────────────────────────
 // Bot
 // ──────────────────────────────────────────────
 
 async function startBot() {
-  let state, saveCreds;
-
-  if (process.env.MONGODB_URI) {
-    console.log("🍃 Using MongoDB for auth state...");
-    const mongoClient = new MongoClient(process.env.MONGODB_URI);
-    await mongoClient.connect();
-    const collection = mongoClient.db("whatsapp-bot").collection("auth_info");
-    const authInfo = await useMongoDBAuthState(collection);
-    state = authInfo.state;
-    saveCreds = authInfo.saveCreds;
-  } else {
-    console.log("📁 Using local file system for auth state...");
-    const authInfo = await useMultiFileAuthState(AUTH_DIR);
-    state = authInfo.state;
-    saveCreds = authInfo.saveCreds;
-  }
-
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   const logger = pino({ level: "silent" });
@@ -971,7 +904,7 @@ async function startBot() {
     if (qr) {
       currentQR = qr;
       botConnected = false;
-      console.log("📱 New QR code generated — open your Northflank URL to scan it");
+      console.log("📱 New QR code generated — open your Railway URL to scan it");
     }
 
     if (connection === "close") {
@@ -983,15 +916,8 @@ async function startBot() {
       }
 
       if (statusCode === DisconnectReason.loggedOut) {
-        console.log(`❌ Session logged out. Clearing ${AUTH_DIR}/ and restarting...`);
-        try {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        } catch (e) {
-          console.error("Failed to delete AUTH_DIR:", e);
-        }
-        botConnected = false;
-        setTimeout(startBot, 3000);
-        return;
+        console.log(`❌ Session logged out. Delete ${AUTH_DIR}/ and restart.`);
+        process.exit(1);
       }
 
       console.log(`⚠️  Connection closed (code ${statusCode}). Reconnecting…`);
