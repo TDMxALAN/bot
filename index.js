@@ -819,7 +819,9 @@ async function checkProfilePictures(sock, watchlist) {
         currentDpUrl = null; // No profile picture set or privacy restricted
       }
 
-      if (currentDpUrl !== target.lastDpUrl) {
+      const getBase = (url) => url ? url.split('?')[0] : null;
+
+      if (getBase(currentDpUrl) !== getBase(target.lastDpUrl)) {
         console.log(`📸 Profile picture changed for ${target.phone}`);
         target.lastDpUrl = currentDpUrl;
         changed = true;
@@ -1303,17 +1305,31 @@ async function startBot() {
         }
 
         // Initial DP fetch
+        let dpBuffer = null;
+        let hasDp = false;
         try {
           watchlist[targetJid].lastDpUrl = await sock.profilePictureUrl(targetJid, "image");
+          const response = await fetch(watchlist[targetJid].lastDpUrl);
+          if (response.ok) {
+            dpBuffer = Buffer.from(await response.arrayBuffer());
+            hasDp = true;
+          }
         } catch (e) {
           watchlist[targetJid].lastDpUrl = null;
         }
 
         saveWatchlist(watchlist);
 
-        await sock.sendMessage(chatJid, {
-          text: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
-        }, { quoted: msg });
+        if (hasDp) {
+          await sock.sendMessage(chatJid, {
+            image: dpBuffer,
+            caption: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
+          }, { quoted: msg });
+        } else {
+          await sock.sendMessage(chatJid, {
+            text: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
+          }, { quoted: msg });
+        }
         continue;
       }
 
