@@ -128,6 +128,66 @@ async function downloadMediaMessage(message, type) {
 }
 
 // ──────────────────────────────────────────────
+// Sticker helpers
+// ──────────────────────────────────────────────
+
+/**
+ * Injects sticker metadata (pack name + sticker name) into a WebP buffer
+ * by appending a custom EXIF chunk that WhatsApp reads.
+ * Format: RIFF…WEBP + EXIF chunk containing JSON in a proprietary layout.
+ * WhatsApp uses a custom chunk tag 'EXIF' with JSON-encoded metadata.
+ */
+function addStickerMetadata(webpBuffer, packName = "", stickerName = "") {
+  try {
+    // Build JSON metadata payload (WhatsApp sticker metadata format)
+    const metadata = JSON.stringify({
+      "sticker-pack-id": `netzee-bot-${Date.now()}`,
+      "sticker-pack-name": packName,
+      "sticker-pack-publisher": "Netzee-bot",
+      "emojis": ["🤖"],
+      "android-app-store-link": "",
+      "ios-app-store-link": "",
+    });
+    const metaBuf = Buffer.from(metadata, "utf8");
+
+    // Build EXIF chunk: tag (4 bytes) + size (4 bytes LE) + data (padded to even)
+    const chunkTag = Buffer.from("EXIF");
+    const padding = metaBuf.length % 2 !== 0 ? Buffer.alloc(1, 0) : Buffer.alloc(0);
+    const chunkSize = Buffer.alloc(4);
+    chunkSize.writeUInt32LE(metaBuf.length + padding.length, 0);
+    const exifChunk = Buffer.concat([chunkTag, chunkSize, metaBuf, padding]);
+
+    // The RIFF file size field is at bytes 4-7; update it
+    const newRiffSize = webpBuffer.length - 8 + exifChunk.length;
+    const result = Buffer.concat([webpBuffer, exifChunk]);
+    result.writeUInt32LE(newRiffSize, 4);
+
+    return result;
+  } catch (err) {
+    console.warn("⚠️ Failed to add sticker metadata:", err.message);
+    return webpBuffer; // Return original if metadata injection fails
+  }
+}
+
+/**
+ * Converts any image buffer to a 512×512 WebP sticker buffer.
+ * Optionally embeds pack/sticker name in EXIF metadata.
+ */
+async function imageToSticker(imageBuffer, packName = "", stickerName = "") {
+  const sharp = require("sharp");
+  let webpBuffer = await sharp(imageBuffer)
+    .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .webp({ quality: 80, lossless: false })
+    .toBuffer();
+
+  if (packName || stickerName) {
+    webpBuffer = addStickerMetadata(webpBuffer, packName, stickerName);
+  }
+
+  return webpBuffer;
+}
+
+// ──────────────────────────────────────────────
 // QR Web Server
 // ──────────────────────────────────────────────
 
@@ -1636,6 +1696,83 @@ async function startBot() {
           }
         }
         continue;
+      }
+
+      // --- COMMAND: !ss (sticker creator / renamer) ---
+      // Trigger: image sent with "!ss [name]" caption  → create sticker
+      //        : text "!ss [name]" replying to a sticker → rename sticker (re-send with new name)
+      {
+        // Determine the effective text for this message (including image captions)
+        const imageMsg = msg.message?.imageMessage;
+        const fullText =
+          text ||
+          msg.message?.imageMessage?.caption ||
+          msg.message?.videoMessage?.caption ||
+          "";
+
+        const ssMatch = fullText.trim().match(/^!ss(\s+(.+))?$/i);
+        const isSSCommand = !!ssMatch;
+
+        if (isSSCommand) {
+          const stickerName = (ssMatch[2] || "").trim();
+
+          // ── Case 1: Message has an image (with !ss as caption) ──
+          if (imageMsg) {
+            await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+            try {
+              const imgBuffer = await downloadMediaMessage(imageMsg, "image");
+              const stickerBuffer = await imageToSticker(imgBuffer, stickerName, stickerName);
+              await sock.sendMessage(chatJid, {
+                sticker: stickerBuffer,
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+              console.log(`🎨 Sticker created${stickerName ? ` with name "${stickerName}"` : ""} for ${chatJid}`);
+            } catch (err) {
+              console.error("Error creating sticker from image:", err);
+              await sock.sendMessage(chatJid, {
+                text: "❌ Failed to create sticker. Make sure you sent a valid image.",
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            }
+            continue;
+          }
+
+          // ── Case 2: Replying to an existing sticker → rename it ──
+          const quotedStickerMsg =
+            msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.stickerMessage;
+          if (quotedStickerMsg) {
+            await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+            try {
+              const stickerData = await downloadMediaMessage(quotedStickerMsg, "sticker");
+              // Re-inject metadata with the new (possibly empty) name
+              const renamedSticker = addStickerMetadata(stickerData, stickerName, stickerName);
+              await sock.sendMessage(chatJid, {
+                sticker: renamedSticker,
+              }, { quoted: msg });
+              const actionMsg = stickerName
+                ? `✅ Sticker renamed to *"${stickerName}"*`
+                : `✅ Sticker name cleared`;
+              await sock.sendMessage(chatJid, { text: actionMsg }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+              console.log(`🎨 Sticker renamed to "${stickerName}" for ${chatJid}`);
+            } catch (err) {
+              console.error("Error renaming sticker:", err);
+              await sock.sendMessage(chatJid, {
+                text: "❌ Failed to rename sticker.",
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+            }
+            continue;
+          }
+
+          // ── Case 3: !ss sent alone without image or sticker quote ──
+          if (isSSCommand && !imageMsg && !quotedStickerMsg) {
+            await sock.sendMessage(chatJid, {
+              text: "❌ *How to use !ss:*\n\n• *Create sticker:* Send an image with caption `!ss` (or `!ss <name>` to set a name)\n• *Rename sticker:* Reply to an existing sticker with `!ss <new name>` (or just `!ss` to clear name)",
+            }, { quoted: msg });
+            continue;
+          }
+        }
       }
 
       // --- COMMAND: !yt ---
