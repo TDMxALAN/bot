@@ -12,6 +12,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 
 // ──────────────────────────────────────────────
 // Persistent data directory
@@ -693,6 +694,29 @@ function phoneToJid(raw) {
   return `${cleaned}@s.whatsapp.net`;
 }
 
+function getSenderJid(msg, sock) {
+  if (msg.key.fromMe) return jidNormalizedUser(sock.user.id);
+  if (msg.key.participant) return jidNormalizedUser(msg.key.participant);
+  return jidNormalizedUser(msg.key.remoteJid);
+}
+
+function isProfilePicNotFoundError(err) {
+  if (!err) return false;
+  const status = err.output?.statusCode || err.statusCode || err.status || err.data;
+  if (status === 404 || status === 401) return true;
+  const msg = (err.message || "").toLowerCase();
+  if (
+    msg.includes("item-not-found") ||
+    msg.includes("not-found") ||
+    msg.includes("404") ||
+    msg.includes("forbidden") ||
+    msg.includes("privacy")
+  ) {
+    return true;
+  }
+  return false;
+}
+
 async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
   const instances = [
     "https://api.cobalt.tools",
@@ -873,35 +897,28 @@ async function checkProfilePictures(sock, watchlist) {
 
     try {
       let currentDpUrl = null;
+      let fetchError = null;
       try {
         currentDpUrl = await sock.profilePictureUrl(targetJid, "image");
       } catch (err) {
-        currentDpUrl = null; // No profile picture set or privacy restricted
+        fetchError = err;
+        currentDpUrl = null; // No profile picture set or privacy restricted or network error
       }
 
-      const getBase = (url) => url ? url.split('?')[0] : null;
+      if (fetchError) {
+        if (!isProfilePicNotFoundError(fetchError)) {
+          console.warn(`⚠️ Temporary network/API error checking DP for ${target.phone}:`, fetchError.message || fetchError);
+          // Do NOT reset DP or send removal alert on network/API errors
+          continue;
+        }
 
-      if (getBase(currentDpUrl) !== getBase(target.lastDpUrl)) {
-        console.log(`📸 Profile picture changed for ${target.phone}`);
-        target.lastDpUrl = currentDpUrl;
-        changed = true;
+        // DP was genuinely removed or hidden
+        if (target.lastDpUrl !== null || target.lastDpHash !== null) {
+          console.log(`📸 Profile picture removed for ${target.phone}`);
+          target.lastDpUrl = null;
+          target.lastDpHash = null;
+          changed = true;
 
-        if (currentDpUrl) {
-          const response = await fetch(currentDpUrl);
-          if (response.ok) {
-            const buffer = Buffer.from(await response.arrayBuffer());
-            for (const requesterJid of target.requesters) {
-              try {
-                await sock.sendMessage(requesterJid, {
-                  image: buffer,
-                  caption: `🔔 Watchlist Alert: *${target.phone}* updated their profile picture!`,
-                });
-              } catch (e) {
-                console.error(`Failed to send DP update to ${requesterJid}:`, e);
-              }
-            }
-          }
-        } else {
           for (const requesterJid of target.requesters) {
             try {
               await sock.sendMessage(requesterJid, {
@@ -911,6 +928,46 @@ async function checkProfilePictures(sock, watchlist) {
               console.error(`Failed to send DP removal update to ${requesterJid}:`, e);
             }
           }
+        }
+        continue;
+      }
+
+      if (currentDpUrl) {
+        try {
+          const response = await fetch(currentDpUrl);
+          if (response.ok) {
+            const buffer = Buffer.from(await response.arrayBuffer());
+            const currentHash = crypto.createHash("md5").update(buffer).digest("hex");
+
+            if (!target.lastDpHash) {
+              // Set initial hash baseline for existing items
+              target.lastDpUrl = currentDpUrl;
+              target.lastDpHash = currentHash;
+              changed = true;
+            } else if (currentHash !== target.lastDpHash) {
+              console.log(`📸 Profile picture updated for ${target.phone}`);
+              target.lastDpUrl = currentDpUrl;
+              target.lastDpHash = currentHash;
+              changed = true;
+
+              for (const requesterJid of target.requesters) {
+                try {
+                  await sock.sendMessage(requesterJid, {
+                    image: buffer,
+                    caption: `🔔 Watchlist Alert: *${target.phone}* updated their profile picture!`,
+                  });
+                } catch (e) {
+                  console.error(`Failed to send DP update to ${requesterJid}:`, e);
+                }
+              }
+            } else if (target.lastDpUrl !== currentDpUrl) {
+              // Same hash, but update URL quietly
+              target.lastDpUrl = currentDpUrl;
+              changed = true;
+            }
+          }
+        } catch (fetchImgErr) {
+          console.warn(`⚠️ Failed to fetch DP image buffer for ${target.phone}:`, fetchImgErr.message || fetchImgErr);
         }
       }
     } catch (err) {
@@ -1005,6 +1062,9 @@ async function startBot() {
 
   // ── Message handler ───────────────────────────
 
+  // Tracks pending watchlist removal sessions: senderJid -> { chatJid, watchedList, timestamp }
+  const pendingWatchlistSessions = new Map();
+
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
@@ -1075,42 +1135,42 @@ async function startBot() {
 
       const chatJid = msg.key.remoteJid;
 
-      // Check if message is a reply to a watchlist message
-      const quotedMessageStr =
-        msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.conversation ||
-        msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.extendedTextMessage?.text ||
-        "";
+      // Check if sender has a pending watchlist session and sent a plain number
+      const senderJidForSession = getSenderJid(msg, sock);
 
-      if (quotedMessageStr.includes("📂 *Your Watchlist:*") && /^\d+$/.test(text.trim())) {
-        const index = parseInt(text.trim(), 10);
-        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
-        
-        const watchedList = [];
-        for (const key of Object.keys(watchlist)) {
-          if (watchlist[key].requesters.includes(senderJid)) {
-            watchedList.push({ key, phone: watchlist[key].phone });
-          }
-        }
-        watchedList.sort((a, b) => a.phone.localeCompare(b.phone));
-        
-        if (index > 0 && index <= watchedList.length) {
-          const target = watchedList[index - 1];
-          watchlist[target.key].requesters = watchlist[target.key].requesters.filter(
-            (r) => r !== senderJid
-          );
-          if (watchlist[target.key].requesters.length === 0) {
-            delete watchlist[target.key];
-          }
-          saveWatchlist(watchlist);
-          await sock.sendMessage(chatJid, {
-            text: `✅ Removed *${target.phone}* from your watchlist.`,
-          }, { quoted: msg });
+      if (/^\d+$/.test(text.trim()) && pendingWatchlistSessions.has(senderJidForSession)) {
+        const session = pendingWatchlistSessions.get(senderJidForSession);
+        // Expire sessions older than 5 minutes
+        if (Date.now() - session.timestamp > 5 * 60 * 1000) {
+          pendingWatchlistSessions.delete(senderJidForSession);
         } else {
-          await sock.sendMessage(chatJid, {
-            text: `❌ Invalid number. Please reply with a valid number from the list.`,
-          }, { quoted: msg });
+          const index = parseInt(text.trim(), 10);
+          const { watchedList } = session;
+
+          if (index > 0 && index <= watchedList.length) {
+            const target = watchedList[index - 1];
+            // Reload watchlist to get latest state before modifying
+            const wl = loadWatchlist();
+            if (wl[target.key]) {
+              wl[target.key].requesters = wl[target.key].requesters.filter(
+                (r) => r !== senderJidForSession
+              );
+              if (wl[target.key].requesters.length === 0) {
+                delete wl[target.key];
+              }
+              saveWatchlist(wl);
+            }
+            pendingWatchlistSessions.delete(senderJidForSession);
+            await sock.sendMessage(chatJid, {
+              text: `✅ Removed *${target.phone}* from your watchlist.`,
+            }, { quoted: msg });
+          } else {
+            await sock.sendMessage(chatJid, {
+              text: `❌ Invalid choice. Please send a valid number from 1 to ${watchedList.length}.`,
+            }, { quoted: msg });
+          }
+          continue;
         }
-        continue;
       }
 
       // Check if message is a reply to one of our active YouTube prompt requests
@@ -1338,7 +1398,7 @@ async function startBot() {
       }
 
       // --- COMMAND: !watch ---
-      if (text.toLowerCase().startsWith("!watch ") && !text.toLowerCase().startsWith("!watchlist")) {
+      if (text.toLowerCase().startsWith("!watch ") || text.trim().toLowerCase() === "!watch") {
         const parts = text.trim().split(/\s+/);
         const targetPhoneRaw = parts.slice(1).join("");
         if (!targetPhoneRaw) {
@@ -1348,14 +1408,15 @@ async function startBot() {
           continue;
         }
 
-        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
+        const senderJid = getSenderJid(msg, sock);
         const targetJid = phoneToJid(targetPhoneRaw);
-        const targetPhone = targetJid.split("@")[0]; // Use cleaned phone number for display
+        const targetPhone = targetJid.split("@")[0]; // Cleaned phone number for display
         
         if (!watchlist[targetJid]) {
           watchlist[targetJid] = {
             phone: targetPhone,
             lastDpUrl: null,
+            lastDpHash: null,
             requesters: [],
           };
         }
@@ -1364,42 +1425,35 @@ async function startBot() {
           watchlist[targetJid].requesters.push(senderJid);
         }
 
-        // Initial DP fetch
-        let dpBuffer = null;
-        let hasDp = false;
+        // Initial DP fetch & hash baseline
         try {
-          watchlist[targetJid].lastDpUrl = await sock.profilePictureUrl(targetJid, "image");
-          const response = await fetch(watchlist[targetJid].lastDpUrl);
+          const currentDpUrl = await sock.profilePictureUrl(targetJid, "image");
+          watchlist[targetJid].lastDpUrl = currentDpUrl;
+          const response = await fetch(currentDpUrl);
           if (response.ok) {
-            dpBuffer = Buffer.from(await response.arrayBuffer());
-            hasDp = true;
+            const buffer = Buffer.from(await response.arrayBuffer());
+            watchlist[targetJid].lastDpHash = crypto.createHash("md5").update(buffer).digest("hex");
           }
         } catch (e) {
           watchlist[targetJid].lastDpUrl = null;
+          watchlist[targetJid].lastDpHash = null;
         }
 
         saveWatchlist(watchlist);
 
-        if (hasDp) {
-          await sock.sendMessage(chatJid, {
-            image: dpBuffer,
-            caption: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
-          }, { quoted: msg });
-        } else {
-          await sock.sendMessage(chatJid, {
-            text: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
-          }, { quoted: msg });
-        }
+        await sock.sendMessage(chatJid, {
+          text: `✅ Added *${targetPhone}* to your watchlist! You will be notified of display picture and status updates.`,
+        }, { quoted: msg });
         continue;
       }
 
       // --- COMMAND: !watchlist ---
       if (text.toLowerCase().startsWith("!watchlist")) {
-        const senderJid = msg.key.fromMe ? jidNormalizedUser(sock.user.id) : jidNormalizedUser(msg.key.remoteJid);
+        const senderJid = getSenderJid(msg, sock);
         
         const watchedList = [];
         for (const key of Object.keys(watchlist)) {
-          if (watchlist[key].requesters.includes(senderJid)) {
+          if (watchlist[key].requesters && watchlist[key].requesters.includes(senderJid)) {
             watchedList.push({ key, phone: watchlist[key].phone });
           }
         }
@@ -1407,12 +1461,18 @@ async function startBot() {
 
         if (watchedList.length === 0) {
           await sock.sendMessage(chatJid, {
-            text: "📂 Your watchlist is currently empty.",
+            text: "📂 Your watchlist is currently empty.\n\nTo add a contact, send: *!watch <phone_number>*\nExample: `!watch 94722666467`",
           }, { quoted: msg });
         } else {
-          const listText = watchedList.map((item, idx) => `${idx + 1}. ${item.phone}`).join("\n");
+          const listText = watchedList.map((item, idx) => `*${idx + 1}.* ${item.phone}`).join("\n");
+          // Store a pending session so the next plain number removes an entry
+          pendingWatchlistSessions.set(senderJid, {
+            chatJid,
+            watchedList,
+            timestamp: Date.now(),
+          });
           await sock.sendMessage(chatJid, {
-            text: `📂 *Your Watchlist:*\n\n${listText}\n\n_Reply to this message with a number to remove it from your watchlist._`,
+            text: `📂 *Your Watchlist:*\n\n${listText}\n\n_Send the number of the contact you want to remove (e.g. 1)._`,
           }, { quoted: msg });
         }
         continue;

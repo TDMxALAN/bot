@@ -5,11 +5,8 @@ A WhatsApp user bot that runs on Railway.com with YouTube downloader, watchlist 
 ## Features
 
 - **`!dp <phone_number>`** — Fetches the display picture of the given phone number and sends it back as an image.
-- **`!watchlist add <phone_number>`** — Watch a contact. The bot will automatically send you their:
-  - Profile picture updates (checked every 10 minutes)
-  - Status updates (Stories) as soon as they post them (text, image, video, audio)
-- **`!watchlist remove <phone_number>`** — Stop watching a contact.
-- **`!watchlist list`** — List all numbers you are currently watching.
+- **`!watch <phone_number>`** — Add a contact to your watchlist. (e.g. `!watch 94722666467`)
+- **`!watchlist`** — View all watched contacts and reply with a number (e.g. `1`) to remove a contact.
 - **`!yt <youtube_url>`** — Download YouTube videos or extract MP3 audio.
   - Choose option 1 (Video) or 2 (Audio) by replying/quoting the bot's prompt message.
   - Automatically handles large files (sends as a document if above 16MB).
@@ -55,9 +52,8 @@ git push -u origin main
 ```
 
 ### 2. Manage Watchlist
-- Add: `!watchlist add 94722666467`
-- Remove: `!watchlist remove 94722666467`
-- List: `!watchlist list`
+- Add: `!watch 94722666467`
+- View & Remove: `!watchlist` (then reply with selection number, e.g. `1`)
 
 ### 3. YouTube Downloader
 - Command: `!yt https://youtu.be/2i2khp_npdE`
