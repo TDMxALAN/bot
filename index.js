@@ -717,6 +717,118 @@ function isProfilePicNotFoundError(err) {
   return false;
 }
 
+function cleanInstagramUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    u.search = ""; // Strip query params like ?igsh=...
+    let clean = u.toString();
+    if (!clean.endsWith("/")) clean += "/";
+    return clean;
+  } catch (e) {
+    return urlStr;
+  }
+}
+
+async function downloadInstagramVideo(igUrl) {
+  const cleanUrl = cleanInstagramUrl(igUrl);
+
+  const services = [
+    // Service 1: vxinstagram proxy
+    async () => {
+      let vxUrl = cleanUrl.replace(/(www\.)?instagr(\.am|am\.com)/, "www.vxinstagram.com");
+      if (vxUrl.includes("/p/")) {
+        vxUrl = vxUrl.replace("/p/", "/reel/");
+      }
+      console.log("Trying vxinstagram:", vxUrl);
+      const res = await fetch(vxUrl, {
+        headers: {
+          "User-Agent": "TelegramBot (like TwitterBot)",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from vxinstagram`);
+      const html = await res.text();
+      const videoMatch =
+        html.match(/<meta property="og:video" content="([^"]+)"/) ||
+        html.match(/<meta property="og:video:secure_url" content="([^"]+)"/) ||
+        html.match(/<meta name="twitter:player:stream" content="([^"]+)"/);
+      if (!videoMatch) throw new Error("No video meta tag found in vxinstagram html");
+
+      const videoUrl = videoMatch[1].replace(/&amp;/g, "&");
+      const vidRes = await fetch(videoUrl, {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+      });
+      if (!vidRes.ok) throw new Error(`HTTP ${vidRes.status} downloading video buffer`);
+      const buffer = Buffer.from(await vidRes.arrayBuffer());
+      if (buffer.length < 5000) throw new Error("Video buffer too small");
+      return { buffer, filename: `ig_video_${Date.now()}.mp4` };
+    },
+    // Service 2: kkinstagram proxy
+    async () => {
+      let kkUrl = cleanUrl.replace(/(www\.)?instagr(\.am|am\.com)/, "www.kkinstagram.com");
+      if (kkUrl.includes("/p/")) {
+        kkUrl = kkUrl.replace("/p/", "/reel/");
+      }
+      console.log("Trying kkinstagram:", kkUrl);
+      const res = await fetch(kkUrl, {
+        headers: {
+          "User-Agent": "TelegramBot (like TwitterBot)",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from kkinstagram`);
+      const html = await res.text();
+      const videoMatch =
+        html.match(/<meta property="og:video" content="([^"]+)"/) ||
+        html.match(/<meta property="og:video:secure_url" content="([^"]+)"/);
+      if (!videoMatch) throw new Error("No video meta tag found in kkinstagram html");
+
+      const videoUrl = videoMatch[1].replace(/&amp;/g, "&");
+      const vidRes = await fetch(videoUrl, {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+      });
+      if (!vidRes.ok) throw new Error(`HTTP ${vidRes.status} downloading video buffer`);
+      const buffer = Buffer.from(await vidRes.arrayBuffer());
+      if (buffer.length < 5000) throw new Error("Video buffer too small");
+      return { buffer, filename: `ig_video_${Date.now()}.mp4` };
+    },
+    // Service 3: Instagram Embed fallback
+    async () => {
+      const embedUrl = `${cleanUrl}embed/captioned/`;
+      console.log("Trying Instagram Embed:", embedUrl);
+      const res = await fetch(embedUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from IG embed`);
+      const html = await res.text();
+      const videoMatch = html.match(/video_url":"([^"]+)"/) || html.match(/src="([^"]+\.mp4[^"]*)"/);
+      if (!videoMatch) throw new Error("No video URL found in IG embed page");
+
+      const videoUrl = videoMatch[1].replace(/\\u0026/g, "&").replace(/&amp;/g, "&");
+      const vidRes = await fetch(videoUrl, {
+        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+      });
+      if (!vidRes.ok) throw new Error(`HTTP ${vidRes.status} downloading video buffer`);
+      const buffer = Buffer.from(await vidRes.arrayBuffer());
+      if (buffer.length < 5000) throw new Error("Video buffer too small");
+      return { buffer, filename: `ig_video_${Date.now()}.mp4` };
+    }
+  ];
+
+  let lastError = null;
+  for (const service of services) {
+    try {
+      return await service();
+    } catch (err) {
+      console.warn("Instagram download service attempt failed:", err.message);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("Failed to download Instagram video from all available services.");
+}
+
 async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
   const instances = [
     "https://api.cobalt.tools",
@@ -1696,38 +1808,44 @@ async function startBot() {
         let filename = `ig_video_${id}.mp4`;
 
         try {
-          // Primary download attempt: Cobalt API
-          const cobaltResult = await downloadFromCobalt(igUrl, false, "1080");
-          videoBuffer = cobaltResult.buffer;
-          filename = cobaltResult.filename;
-          console.log("✅ Successfully downloaded Instagram video using Cobalt API.");
-        } catch (cobaltErr) {
-          console.warn("⚠️ Cobalt Instagram download failed. Falling back to local yt-dlp...", cobaltErr.message);
+          // Primary download attempt: Dedicated Instagram scrapers (vxinstagram / kkinstagram / embed fallback)
+          const result = await downloadInstagramVideo(igUrl);
+          videoBuffer = result.buffer;
+          filename = result.filename;
+          console.log("✅ Successfully downloaded Instagram video using Instagram resolution services.");
+        } catch (igErr) {
+          console.warn("⚠️ Dedicated Instagram downloader failed. Trying fallback Cobalt / yt-dlp...", igErr.message);
           try {
-            await runYtDlp([
-              "-f", "best[ext=mp4]/best",
-              "--recode-video", "mp4",
-              "--no-playlist",
-              "--max-filesize", "50M",
-              "-o", outputPath,
-              igUrl
-            ]);
+            const cobaltResult = await downloadFromCobalt(igUrl, false, "1080");
+            videoBuffer = cobaltResult.buffer;
+            filename = cobaltResult.filename;
+          } catch (cobaltErr) {
+            try {
+              await runYtDlp([
+                "-f", "best[ext=mp4]/best",
+                "--recode-video", "mp4",
+                "--no-playlist",
+                "--max-filesize", "50M",
+                "-o", outputPath,
+                igUrl
+              ]);
 
-            if (fs.existsSync(outputPath)) {
-              videoBuffer = fs.readFileSync(outputPath);
-            } else {
-              throw new Error("Video file was not created by yt-dlp");
-            }
-          } catch (dlpErr) {
-            console.error("❌ Fallback local yt-dlp Instagram download failed:", dlpErr);
-            await sock.sendMessage(chatJid, {
-              text: `❌ Failed to download Instagram video. It might be too large (>50MB), private, or restricted.\n\nError: ${dlpErr.message}`,
-            }, { quoted: msg });
-            await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
-            continue;
-          } finally {
-            if (fs.existsSync(outputPath)) {
-              fs.unlinkSync(outputPath);
+              if (fs.existsSync(outputPath)) {
+                videoBuffer = fs.readFileSync(outputPath);
+              } else {
+                throw new Error("Video file was not created by yt-dlp");
+              }
+            } catch (dlpErr) {
+              console.error("❌ All Instagram download attempts failed:", dlpErr);
+              await sock.sendMessage(chatJid, {
+                text: `❌ Failed to download Instagram video. It might be too large (>50MB), private, or restricted.\n\nError: ${igErr.message || dlpErr.message}`,
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+              continue;
+            } finally {
+              if (fs.existsSync(outputPath)) {
+                fs.unlinkSync(outputPath);
+              }
             }
           }
         }
