@@ -1052,10 +1052,29 @@ async function checkProfilePictures(sock, watchlist) {
             const currentHash = crypto.createHash("md5").update(buffer).digest("hex");
 
             if (!target.lastDpHash) {
-              // Set initial hash baseline for existing items
-              target.lastDpUrl = currentDpUrl;
-              target.lastDpHash = currentHash;
-              changed = true;
+              if (target.lastDpUrl === null) {
+                // DP was previously removed/absent — now they have one again, notify!
+                console.log(`📸 Profile picture re-added for ${target.phone}`);
+                target.lastDpUrl = currentDpUrl;
+                target.lastDpHash = currentHash;
+                changed = true;
+
+                for (const requesterJid of target.requesters) {
+                  try {
+                    await sock.sendMessage(requesterJid, {
+                      image: buffer,
+                      caption: `🔔 Watchlist Alert: *${target.phone}* added a new profile picture!`,
+                    });
+                  } catch (e) {
+                    console.error(`Failed to send DP added update to ${requesterJid}:`, e);
+                  }
+                }
+              } else {
+                // No hash yet (existing entry before hash tracking) — set baseline silently
+                target.lastDpUrl = currentDpUrl;
+                target.lastDpHash = currentHash;
+                changed = true;
+              }
             } else if (currentHash !== target.lastDpHash) {
               console.log(`📸 Profile picture updated for ${target.phone}`);
               target.lastDpUrl = currentDpUrl;
