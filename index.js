@@ -133,14 +133,18 @@ async function downloadMediaMessage(message, type) {
 // ──────────────────────────────────────────────
 
 /**
- * Injects sticker metadata (pack name + sticker name) into a WebP buffer
- * by appending a custom EXIF chunk that WhatsApp reads.
- * Format: RIFF…WEBP + EXIF chunk containing JSON in a proprietary layout.
- * WhatsApp uses a custom chunk tag 'EXIF' with JSON-encoded metadata.
+ * Injects sticker metadata into a WebP buffer.
+ *
+ * WebP RIFF structure:
+ *   Simple file:   RIFF + SIZE + WEBP + VP8 /VP8L chunk  (only one image chunk allowed)
+ *   Extended file: RIFF + SIZE + WEBP + VP8X chunk + optional chunks (ICCP, VP8/VP8L, EXIF...)
+ *
+ * A simple file CANNOT carry extra chunks -- we must first promote it to the
+ * extended (VP8X) format before appending the EXIF chunk.
  */
 function addStickerMetadata(webpBuffer, packName = "", stickerName = "") {
   try {
-    // Build JSON metadata payload (WhatsApp sticker metadata format)
+    // -- Build EXIF/JSON payload (WhatsApp sticker metadata) --
     const metadata = JSON.stringify({
       "sticker-pack-id": `netzee-bot-${Date.now()}`,
       "sticker-pack-name": packName,
@@ -150,35 +154,67 @@ function addStickerMetadata(webpBuffer, packName = "", stickerName = "") {
       "ios-app-store-link": "",
     });
     const metaBuf = Buffer.from(metadata, "utf8");
+    // RIFF chunks must be even-length; pad with a null byte if needed
+    const metaPad = metaBuf.length % 2 !== 0 ? Buffer.alloc(1, 0) : Buffer.alloc(0);
 
-    // Build EXIF chunk: tag (4 bytes) + size (4 bytes LE) + data (padded to even)
-    const chunkTag = Buffer.from("EXIF");
-    const padding = metaBuf.length % 2 !== 0 ? Buffer.alloc(1, 0) : Buffer.alloc(0);
-    const chunkSize = Buffer.alloc(4);
-    chunkSize.writeUInt32LE(metaBuf.length + padding.length, 0);
-    const exifChunk = Buffer.concat([chunkTag, chunkSize, metaBuf, padding]);
+    const exifSizeBuf = Buffer.alloc(4);
+    exifSizeBuf.writeUInt32LE(metaBuf.length + metaPad.length, 0);
+    const exifChunk = Buffer.concat([Buffer.from("EXIF"), exifSizeBuf, metaBuf, metaPad]);
 
-    // The RIFF file size field is at bytes 4-7; update it
-    const newRiffSize = webpBuffer.length - 8 + exifChunk.length;
-    const result = Buffer.concat([webpBuffer, exifChunk]);
-    result.writeUInt32LE(newRiffSize, 4);
+    // -- Inspect the first chunk tag at offset 12-15 --
+    const firstTag = webpBuffer.slice(12, 16).toString("ascii");
 
-    return result;
+    if (firstTag === "VP8X") {
+      // Already extended format -- set EXIF flag (bit 3) and append chunk
+      const result = Buffer.from(webpBuffer); // mutable copy
+      const flags = result.readUInt32LE(20);
+      result.writeUInt32LE(flags | (1 << 3), 20);
+      const final = Buffer.concat([result, exifChunk]);
+      final.writeUInt32LE(final.length - 8, 4); // update RIFF size field
+      return final;
+    }
+
+    // -- Simple VP8 or VP8L -- promote to extended (VP8X) format --
+    // Stickers are always 512x512, so we hardcode the canvas size.
+    const W = 512;
+    const H = 512;
+
+    // VP8X data = 10 bytes: flags (4) + canvas_width_minus_1 (3 LE) + canvas_height_minus_1 (3 LE)
+    const vp8xData = Buffer.alloc(10, 0);
+    vp8xData.writeUInt32LE(1 << 3, 0); // bit 3 = EXIF present
+    vp8xData.writeUIntLE(W - 1, 4, 3); // canvas width  - 1
+    vp8xData.writeUIntLE(H - 1, 7, 3); // canvas height - 1
+
+    const vp8xSizeBuf = Buffer.alloc(4);
+    vp8xSizeBuf.writeUInt32LE(10, 0); // VP8X data is always 10 bytes
+    const vp8xChunk = Buffer.concat([Buffer.from("VP8X"), vp8xSizeBuf, vp8xData]);
+
+    // Original image chunk(s) start right after the 12-byte RIFF header (RIFF+SIZE+WEBP)
+    const imageChunks = webpBuffer.slice(12);
+
+    // Rebuild: RIFF + size + WEBP + VP8X + original image chunk(s) + EXIF
+    const body = Buffer.concat([Buffer.from("WEBP"), vp8xChunk, imageChunks, exifChunk]);
+    const riffSizeBuf = Buffer.alloc(4);
+    riffSizeBuf.writeUInt32LE(body.length, 0);
+    return Buffer.concat([Buffer.from("RIFF"), riffSizeBuf, body]);
+
   } catch (err) {
-    console.warn("⚠️ Failed to add sticker metadata:", err.message);
-    return webpBuffer; // Return original if metadata injection fails
+    console.warn("Failed to add sticker metadata:", err.message);
+    return webpBuffer; // fall back to unmodified WebP
   }
 }
 
 /**
- * Converts any image buffer to a 512×512 WebP sticker buffer.
- * Optionally embeds pack/sticker name in EXIF metadata.
+ * Converts any image buffer to a 512x512 WebP sticker buffer.
+ * Uses lossless WebP so alpha/transparency is correctly preserved.
+ * Optionally embeds pack/sticker name via a properly-structured EXIF chunk.
  */
 async function imageToSticker(imageBuffer, packName = "", stickerName = "") {
   const sharp = require("sharp");
+  // lossless: true preserves alpha channel correctly for stickers
   let webpBuffer = await sharp(imageBuffer)
     .resize(512, 512, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-    .webp({ quality: 80, lossless: false })
+    .webp({ lossless: true })
     .toBuffer();
 
   if (packName || stickerName) {
