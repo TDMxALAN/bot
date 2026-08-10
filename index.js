@@ -139,64 +139,104 @@ async function downloadMediaMessage(message, type) {
  *   Simple file:   RIFF + SIZE + WEBP + VP8 /VP8L chunk  (only one image chunk allowed)
  *   Extended file: RIFF + SIZE + WEBP + VP8X chunk + optional chunks (ICCP, VP8/VP8L, EXIF...)
  *
- * A simple file CANNOT carry extra chunks -- we must first promote it to the
- * extended (VP8X) format before appending the EXIF chunk.
+ * Key rule: a simple file CANNOT carry extra chunks.
+ * Key rule: EXIF must appear AT MOST ONCE.
+ *
+ * Strategy:
+ *   - Parse every RIFF chunk in the file.
+ *   - Strip any existing EXIF chunk (avoids the double-EXIF bug on renamed stickers).
+ *   - If the file is simple (VP8/VP8L), prepend a VP8X extended header.
+ *   - Set the EXIF flag in VP8X and append one fresh EXIF chunk at the end.
  */
 function addStickerMetadata(webpBuffer, packName = "", stickerName = "") {
   try {
-    // -- Build EXIF/JSON payload (WhatsApp sticker metadata) --
+    // Build JSON metadata payload (WhatsApp sticker format)
     const metadata = JSON.stringify({
       "sticker-pack-id": `netzee-bot-${Date.now()}`,
       "sticker-pack-name": packName,
       "sticker-pack-publisher": "Netzee-bot",
-      "emojis": ["🤖"],
+      "emojis": ["\uD83E\uDD16"],
       "android-app-store-link": "",
       "ios-app-store-link": "",
     });
     const metaBuf = Buffer.from(metadata, "utf8");
     // RIFF chunks must be even-length; pad with a null byte if needed
     const metaPad = metaBuf.length % 2 !== 0 ? Buffer.alloc(1, 0) : Buffer.alloc(0);
-
     const exifSizeBuf = Buffer.alloc(4);
     exifSizeBuf.writeUInt32LE(metaBuf.length + metaPad.length, 0);
-    const exifChunk = Buffer.concat([Buffer.from("EXIF"), exifSizeBuf, metaBuf, metaPad]);
+    const newExifChunk = Buffer.concat([Buffer.from("EXIF"), exifSizeBuf, metaBuf, metaPad]);
 
-    // -- Inspect the first chunk tag at offset 12-15 --
-    const firstTag = webpBuffer.slice(12, 16).toString("ascii");
-
-    if (firstTag === "VP8X") {
-      // Already extended format -- set EXIF flag (bit 3) and append chunk
-      const result = Buffer.from(webpBuffer); // mutable copy
-      const flags = result.readUInt32LE(20);
-      result.writeUInt32LE(flags | (1 << 3), 20);
-      const final = Buffer.concat([result, exifChunk]);
-      final.writeUInt32LE(final.length - 8, 4); // update RIFF size field
-      return final;
+    // Parse all RIFF chunks starting after the 12-byte header (RIFF+SIZE+WEBP)
+    const parsedChunks = [];
+    let offset = 12;
+    while (offset + 8 <= webpBuffer.length) {
+      const tag      = webpBuffer.slice(offset, offset + 4).toString("ascii");
+      const size     = webpBuffer.readUInt32LE(offset + 4);
+      const paddedSz = size + (size % 2 !== 0 ? 1 : 0);
+      const data     = Buffer.from(webpBuffer.slice(offset + 8, offset + 8 + size));
+      parsedChunks.push({ tag, size, data });
+      offset += 8 + paddedSz;
     }
 
-    // -- Simple VP8 or VP8L -- promote to extended (VP8X) format --
-    // Stickers are always 512x512, so we hardcode the canvas size.
-    const W = 512;
-    const H = 512;
+    // Helper: serialize a parsed chunk back to bytes
+    function serializeChunk(c) {
+      const tagBuf  = Buffer.from(c.tag);
+      const sizeBuf = Buffer.alloc(4);
+      sizeBuf.writeUInt32LE(c.size, 0);
+      const pad = c.size % 2 !== 0 ? Buffer.alloc(1, 0) : Buffer.alloc(0);
+      return Buffer.concat([tagBuf, sizeBuf, c.data, pad]);
+    }
 
-    // VP8X data = 10 bytes: flags (4) + canvas_width_minus_1 (3 LE) + canvas_height_minus_1 (3 LE)
-    const vp8xData = Buffer.alloc(10, 0);
-    vp8xData.writeUInt32LE(1 << 3, 0); // bit 3 = EXIF present
-    vp8xData.writeUIntLE(W - 1, 4, 3); // canvas width  - 1
-    vp8xData.writeUIntLE(H - 1, 7, 3); // canvas height - 1
+    const isExtended = parsedChunks.length > 0 && parsedChunks[0].tag === "VP8X";
 
-    const vp8xSizeBuf = Buffer.alloc(4);
-    vp8xSizeBuf.writeUInt32LE(10, 0); // VP8X data is always 10 bytes
-    const vp8xChunk = Buffer.concat([Buffer.from("VP8X"), vp8xSizeBuf, vp8xData]);
+    if (isExtended) {
+      // Extended (VP8X) format:
+      // Strip ALL existing EXIF chunks, update VP8X EXIF flag, append one fresh EXIF at the end.
+      const filtered = parsedChunks.filter(c => c.tag !== "EXIF");
 
-    // Original image chunk(s) start right after the 12-byte RIFF header (RIFF+SIZE+WEBP)
-    const imageChunks = webpBuffer.slice(12);
+      // Set EXIF flag (bit 3) in VP8X flags field (first 4 bytes of VP8X data)
+      const vp8xEntry = filtered[0];
+      if (vp8xEntry && vp8xEntry.data.length >= 4) {
+        vp8xEntry.data.writeUInt32LE(vp8xEntry.data.readUInt32LE(0) | (1 << 3), 0);
+      }
 
-    // Rebuild: RIFF + size + WEBP + VP8X + original image chunk(s) + EXIF
-    const body = Buffer.concat([Buffer.from("WEBP"), vp8xChunk, imageChunks, exifChunk]);
-    const riffSizeBuf = Buffer.alloc(4);
-    riffSizeBuf.writeUInt32LE(body.length, 0);
-    return Buffer.concat([Buffer.from("RIFF"), riffSizeBuf, body]);
+      const body = Buffer.concat([
+        Buffer.from("WEBP"),
+        ...filtered.map(serializeChunk),
+        newExifChunk,
+      ]);
+      const riffSizeBuf = Buffer.alloc(4);
+      riffSizeBuf.writeUInt32LE(body.length, 0);
+      return Buffer.concat([Buffer.from("RIFF"), riffSizeBuf, body]);
+
+    } else {
+      // Simple (VP8 / VP8L) format — promote to VP8X extended.
+      // Stickers are always 512x512 so canvas dimensions are hardcoded.
+      const W = 512;
+      const H = 512;
+
+      // VP8X data: flags(4) + canvas_width_minus_1(3 LE) + canvas_height_minus_1(3 LE) = 10 bytes
+      const vp8xData = Buffer.alloc(10, 0);
+      vp8xData.writeUInt32LE(1 << 3, 0); // bit 3 = EXIF present
+      vp8xData.writeUIntLE(W - 1, 4, 3);
+      vp8xData.writeUIntLE(H - 1, 7, 3);
+      const vp8xSizeBuf = Buffer.alloc(4);
+      vp8xSizeBuf.writeUInt32LE(10, 0);
+      const vp8xChunk = Buffer.concat([Buffer.from("VP8X"), vp8xSizeBuf, vp8xData]);
+
+      // Strip any stray EXIF from the simple chunks (shouldn't exist, but be safe)
+      const imageChunks = parsedChunks.filter(c => c.tag !== "EXIF");
+
+      const body = Buffer.concat([
+        Buffer.from("WEBP"),
+        vp8xChunk,
+        ...imageChunks.map(serializeChunk),
+        newExifChunk,
+      ]);
+      const riffSizeBuf = Buffer.alloc(4);
+      riffSizeBuf.writeUInt32LE(body.length, 0);
+      return Buffer.concat([Buffer.from("RIFF"), riffSizeBuf, body]);
+    }
 
   } catch (err) {
     console.warn("Failed to add sticker metadata:", err.message);
@@ -768,87 +808,158 @@ function cleanInstagramUrl(urlStr) {
 async function downloadInstagramVideo(igUrl) {
   const cleanUrl = cleanInstagramUrl(igUrl);
 
+  // Extract the shortcode from the URL (works for /p/, /reel/, /reels/)
+  function extractShortcode(url) {
+    const match = url.match(/instagram\.com\/(?:[A-Za-z0-9_.]+\/)?(?:p|reel|reels|tv)\/([-A-Za-z0-9_]+)/);
+    return match ? match[1] : null;
+  }
+
+  // Fetch and download a video from a direct mp4 URL
+  async function fetchVideoBuffer(videoUrl) {
+    const vidRes = await fetch(videoUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.instagram.com/"
+      }
+    });
+    if (!vidRes.ok) throw new Error(`HTTP ${vidRes.status} downloading video buffer`);
+    const buffer = Buffer.from(await vidRes.arrayBuffer());
+    if (buffer.length < 5000) throw new Error("Video buffer too small, likely not a real video");
+    return buffer;
+  }
+
   const services = [
-    // Service 1: vxinstagram proxy
+    // Service 1: Instagram internal JSON API (?__a=1)
+    // Works for public posts by passing X-IG-App-ID header
     async () => {
-      let vxUrl = cleanUrl.replace(/(www\.)?instagr(\.am|am\.com)/, "www.vxinstagram.com");
-      if (vxUrl.includes("/p/")) {
-        vxUrl = vxUrl.replace("/p/", "/reel/");
-      }
-      console.log("Trying vxinstagram:", vxUrl);
-      const res = await fetch(vxUrl, {
+      const shortcode = extractShortcode(cleanUrl);
+      if (!shortcode) throw new Error("Could not extract shortcode from URL");
+      const apiUrl = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
+      console.log("Trying IG internal API (?__a=1):", apiUrl);
+      const res = await fetch(apiUrl, {
         headers: {
-          "User-Agent": "TelegramBot (like TwitterBot)",
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Accept": "*/*",
+          "Accept-Language": "en-US,en;q=0.9",
+          "X-IG-App-ID": "936619743392459",
+          "X-Requested-With": "XMLHttpRequest",
+          "Sec-Fetch-Dest": "empty",
+          "Sec-Fetch-Mode": "cors",
+          "Sec-Fetch-Site": "same-origin",
+          "Referer": `https://www.instagram.com/p/${shortcode}/`
         }
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status} from vxinstagram`);
-      const html = await res.text();
-      const videoMatch =
-        html.match(/<meta property="og:video" content="([^"]+)"/) ||
-        html.match(/<meta property="og:video:secure_url" content="([^"]+)"/) ||
-        html.match(/<meta name="twitter:player:stream" content="([^"]+)"/);
-      if (!videoMatch) throw new Error("No video meta tag found in vxinstagram html");
-
-      const videoUrl = videoMatch[1].replace(/&amp;/g, "&");
-      const vidRes = await fetch(videoUrl, {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-      });
-      if (!vidRes.ok) throw new Error(`HTTP ${vidRes.status} downloading video buffer`);
-      const buffer = Buffer.from(await vidRes.arrayBuffer());
-      if (buffer.length < 5000) throw new Error("Video buffer too small");
+      if (!res.ok) throw new Error(`HTTP ${res.status} from IG API`);
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); } catch(e) { throw new Error("IG API returned non-JSON: " + text.slice(0, 100)); }
+      // Navigate to video_url
+      const item = json?.items?.[0];
+      if (!item) throw new Error("No items in IG API response");
+      let videoUrl = item?.video_url ||
+        item?.carousel_media?.[0]?.video_url;
+      if (!videoUrl) throw new Error("No video_url in IG API response");
+      videoUrl = videoUrl.replace(/\\u0026/g, "&");
+      const buffer = await fetchVideoBuffer(videoUrl);
       return { buffer, filename: `ig_video_${Date.now()}.mp4` };
     },
-    // Service 2: kkinstagram proxy
+
+    // Service 2: SaveInsta.to form-POST scraper
     async () => {
-      let kkUrl = cleanUrl.replace(/(www\.)?instagr(\.am|am\.com)/, "www.kkinstagram.com");
-      if (kkUrl.includes("/p/")) {
-        kkUrl = kkUrl.replace("/p/", "/reel/");
-      }
-      console.log("Trying kkinstagram:", kkUrl);
-      const res = await fetch(kkUrl, {
+      console.log("Trying SaveInsta scraper for:", cleanUrl);
+      // Step 1: Get token from homepage
+      const homeRes = await fetch("https://saveinsta.app/", {
         headers: {
-          "User-Agent": "TelegramBot (like TwitterBot)",
-          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status} from kkinstagram`);
-      const html = await res.text();
-      const videoMatch =
-        html.match(/<meta property="og:video" content="([^"]+)"/) ||
-        html.match(/<meta property="og:video:secure_url" content="([^"]+)"/);
-      if (!videoMatch) throw new Error("No video meta tag found in kkinstagram html");
-
-      const videoUrl = videoMatch[1].replace(/&amp;/g, "&");
-      const vidRes = await fetch(videoUrl, {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+      const homeHtml = await homeRes.text();
+      const tokenMatch = homeHtml.match(/name="_token"[^>]+value="([^"]+)"/);
+      if (!tokenMatch) throw new Error("Could not find _token on SaveInsta homepage");
+      const token = tokenMatch[1];
+      // Step 2: Post the URL
+      const formData = new URLSearchParams();
+      formData.append("url", cleanUrl);
+      formData.append("_token", token);
+      const postRes = await fetch("https://saveinsta.app/api/ajaxSearch", {
+        method: "POST",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Referer": "https://saveinsta.app/",
+          "X-Requested-With": "XMLHttpRequest"
+        },
+        body: formData.toString()
       });
-      if (!vidRes.ok) throw new Error(`HTTP ${vidRes.status} downloading video buffer`);
-      const buffer = Buffer.from(await vidRes.arrayBuffer());
-      if (buffer.length < 5000) throw new Error("Video buffer too small");
+      if (!postRes.ok) throw new Error(`HTTP ${postRes.status} from SaveInsta API`);
+      const data = await postRes.json();
+      if (data.status !== "ok") throw new Error("SaveInsta returned status: " + data.status);
+      // Parse the HTML response for video links
+      const html = data.data || "";
+      const linkMatch = html.match(/href="(https?:\/\/[^"]+\.mp4[^"]*)"/);
+      if (!linkMatch) throw new Error("No mp4 link found in SaveInsta response");
+      const videoUrl = linkMatch[1].replace(/&amp;/g, "&");
+      const buffer = await fetchVideoBuffer(videoUrl);
       return { buffer, filename: `ig_video_${Date.now()}.mp4` };
     },
-    // Service 3: Instagram Embed fallback
+
+    // Service 3: igram.world API (form-POST based)
     async () => {
-      const embedUrl = `${cleanUrl}embed/captioned/`;
-      console.log("Trying Instagram Embed:", embedUrl);
+      console.log("Trying igram.world scraper for:", cleanUrl);
+      const formData = new URLSearchParams();
+      formData.append("url", cleanUrl);
+      const res = await fetch("https://igram.world/api/convert", {
+        method: "POST",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Referer": "https://igram.world/",
+          "Origin": "https://igram.world"
+        },
+        body: formData.toString()
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from igram.world`);
+      const data = await res.json();
+      const items = data?.url || data?.data || data;
+      if (!Array.isArray(items) || items.length === 0) throw new Error("No items from igram.world");
+      const videoItem = items.find(i => i.type === "mp4" || (i.url && i.url.includes(".mp4")));
+      if (!videoItem) throw new Error("No mp4 item in igram.world response");
+      const videoUrl = videoItem.url.replace(/&amp;/g, "&");
+      const buffer = await fetchVideoBuffer(videoUrl);
+      return { buffer, filename: `ig_video_${Date.now()}.mp4` };
+    },
+
+    // Service 4: Instagram Embed page (improved regex)
+    async () => {
+      const shortcode = extractShortcode(cleanUrl);
+      if (!shortcode) throw new Error("Could not extract shortcode from URL");
+      const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
+      console.log("Trying Instagram Embed page:", embedUrl);
       const res = await fetch(embedUrl, {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9"
         }
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} from IG embed`);
       const html = await res.text();
-      const videoMatch = html.match(/video_url":"([^"]+)"/) || html.match(/src="([^"]+\.mp4[^"]*)"/);
-      if (!videoMatch) throw new Error("No video URL found in IG embed page");
-
-      const videoUrl = videoMatch[1].replace(/\\u0026/g, "&").replace(/&amp;/g, "&");
-      const vidRes = await fetch(videoUrl, {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-      });
-      if (!vidRes.ok) throw new Error(`HTTP ${vidRes.status} downloading video buffer`);
-      const buffer = Buffer.from(await vidRes.arrayBuffer());
-      if (buffer.length < 5000) throw new Error("Video buffer too small");
+      // Try multiple patterns to extract the video URL
+      const patterns = [
+        /\"video_url\":\"([^"]+)\"/,
+        /video_url&quot;:&quot;([^&]+)&quot;/,
+        /<source[^>]+src="([^"]+\.mp4[^"]*)"/,
+        /src:\s*['"]([^'"]+\.mp4[^'"]*)['"]/, 
+        /"contentUrl":\s*"([^"]+)"/
+      ];
+      let videoUrl = null;
+      for (const pat of patterns) {
+        const m = html.match(pat);
+        if (m) { videoUrl = m[1]; break; }
+      }
+      if (!videoUrl) throw new Error("No video URL found in IG embed page");
+      videoUrl = videoUrl.replace(/\\u0026/g, "&").replace(/&amp;/g, "&").replace(/\\\/g, "");
+      const buffer = await fetchVideoBuffer(videoUrl);
       return { buffer, filename: `ig_video_${Date.now()}.mp4` };
     }
   ];
@@ -878,7 +989,7 @@ async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
   for (const instance of instances) {
     try {
       console.log(`Trying Cobalt instance: ${instance}`);
-      const response = await fetch(`${instance}/api/json`, {
+      const response = await fetch(`${instance}/`, {
         method: "POST",
         headers: {
           "Accept": "application/json",
@@ -886,9 +997,9 @@ async function downloadFromCobalt(videoUrl, isAudioOnly, quality = "720") {
         },
         body: JSON.stringify({
           url: videoUrl,
-          isAudioOnly: isAudioOnly,
+          downloadMode: isAudioOnly ? "audio" : "auto",
           videoQuality: quality,
-          filenamePattern: "basic",
+          filenameStyle: "basic",
         }),
       });
 
