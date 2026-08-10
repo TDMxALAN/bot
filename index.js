@@ -958,7 +958,7 @@ async function downloadInstagramVideo(igUrl) {
         if (m) { videoUrl = m[1]; break; }
       }
       if (!videoUrl) throw new Error("No video URL found in IG embed page");
-      videoUrl = videoUrl.replace(/\\u0026/g, "&").replace(/&amp;/g, "&").replace(/\\\/g, "");
+      videoUrl = videoUrl.replace(/\\u0026/g, "&").replace(/&amp;/g, "&").split("\\").join("");
       const buffer = await fetchVideoBuffer(videoUrl);
       return { buffer, filename: `ig_video_${Date.now()}.mp4` };
     }
