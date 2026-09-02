@@ -1,0 +1,24 @@
+{
+  "name": "netzee-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp bot that fetches display pictures",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "python3 -m venv .venv && .venv/bin/pip install yt-dlp yt-dlp-getpot-wpc"
+  },
+  "dependencies": {
+    "@bochilteam/scraper-facebook": "^5.0.0",
+    "@whiskeysockets/baileys": "^6.7.16",
+    "cheerio": "^1.2.0",
+    "fb-downloader-scrapper": "^3.0.1",
+    "nayan-media-downloader": "^0.0.1-security",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "rahad-media-downloader": "^2.1.14",
+    "sharp": "^0.35.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
