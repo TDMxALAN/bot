@@ -1620,39 +1620,39 @@ async function startBot() {
 
       // ── Bad word filter monitoring (for group messages) ──
       if (chatJid.endsWith("@g.us")) {
-        const badFilterStore = loadBadFilter();
-        const groupConfig = badFilterStore[chatJid];
-        if (groupConfig && groupConfig.enabled && groupConfig.words && groupConfig.words.length > 0) {
-          let isAdmin = false;
-          try {
-            const metadata = await sock.groupMetadata(chatJid);
-            const senderJid = getSenderJid(msg, sock);
-            isAdmin = msg.key.fromMe || checkUserIsGroupAdmin(metadata, senderJid, sock.user);
-          } catch (err) {
-            console.error("Error fetching group metadata for badfilter check:", err);
-          }
-
-          if (!isAdmin) {
-            const fullText = text.toLowerCase();
+        const trimmedText = (text || "").trim().toLowerCase();
+        // Do not delete !badfilter management commands so admins can configure/disable it
+        if (!trimmedText.startsWith("!badfilter")) {
+          const badFilterStore = loadBadFilter();
+          const groupConfig = badFilterStore[chatJid];
+          if (groupConfig && groupConfig.enabled && Array.isArray(groupConfig.words) && groupConfig.words.length > 0) {
+            const fullText = (text || "").toLowerCase();
             if (fullText) {
-              const containsBadWord = groupConfig.words.some((word) =>
-                word && fullText.includes(word.toLowerCase())
-              );
+              const containsBadWord = groupConfig.words.some((word) => {
+                if (!word || typeof word !== "string") return false;
+                const cleanWord = word.trim().toLowerCase();
+                return cleanWord.length > 0 && fullText.includes(cleanWord);
+              });
 
               if (containsBadWord) {
                 const senderJid = getSenderJid(msg, sock);
-                console.log(`🚫 Bad word detected in group ${chatJid} from ${senderJid}. Deleting message...`);
+                console.log(`🚫 Bad word detected in group ${chatJid} from ${senderJid}. Deleting message ${msg.key.id}...`);
                 try {
-                  const deleteKey = {
-                    remoteJid: chatJid,
-                    fromMe: msg.key.fromMe || false,
-                    id: msg.key.id,
-                    participant: msg.key.participant || msg.participant || senderJid,
-                  };
-                  await sock.sendMessage(chatJid, { delete: deleteKey });
-                  console.log(`✅ Message ${msg.key.id} successfully deleted from group ${chatJid}.`);
-                } catch (delErr) {
-                  console.error("Failed to delete message containing bad word:", delErr);
+                  await sock.sendMessage(chatJid, { delete: msg.key });
+                  console.log(`✅ Successfully deleted message ${msg.key.id} from group ${chatJid}.`);
+                } catch (delErr1) {
+                  try {
+                    const deleteKey = {
+                      remoteJid: chatJid,
+                      fromMe: msg.key.fromMe || false,
+                      id: msg.key.id,
+                      participant: msg.key.participant || msg.participant || senderJid,
+                    };
+                    await sock.sendMessage(chatJid, { delete: deleteKey });
+                    console.log(`✅ Successfully deleted message ${msg.key.id} (with explicit deleteKey) from group ${chatJid}.`);
+                  } catch (delErr2) {
+                    console.error("❌ Failed to delete message containing bad word:", delErr2);
+                  }
                 }
                 continue; // Quietly delete and skip further handling
               }
