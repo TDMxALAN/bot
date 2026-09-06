@@ -915,6 +915,58 @@ function getSenderJid(msg, sock) {
   return jidNormalizedUser(msg.key.remoteJid);
 }
 
+function cleanJidNumber(jid) {
+  if (!jid || typeof jid !== "string") return "";
+  const normalized = jidNormalizedUser(jid);
+  return normalized.split("@")[0].split(":")[0];
+}
+
+function isParticipantAdmin(participant) {
+  if (!participant) return false;
+  return (
+    participant.admin === "admin" ||
+    participant.admin === "superadmin" ||
+    participant.admin === true ||
+    participant.isAdmin === true ||
+    !!participant.admin
+  );
+}
+
+function checkUserIsGroupAdmin(groupMetadata, userJid, sockUser = null) {
+  if (!groupMetadata || !Array.isArray(groupMetadata.participants)) return false;
+
+  const targetNorm = userJid ? jidNormalizedUser(userJid) : "";
+  const targetNum = cleanJidNumber(userJid);
+
+  const sockUserNorm = sockUser?.id ? jidNormalizedUser(sockUser.id) : (sockUser?.jid ? jidNormalizedUser(sockUser.jid) : "");
+  const sockUserNum = cleanJidNumber(sockUser?.id || sockUser?.jid);
+  const sockUserLidNorm = sockUser?.lid ? jidNormalizedUser(sockUser.lid) : "";
+  const sockUserLidNum = cleanJidNumber(sockUser?.lid);
+
+  const participant = groupMetadata.participants.find((p) => {
+    if (!p) return false;
+    const pIdNorm = p.id ? jidNormalizedUser(p.id) : (p.jid ? jidNormalizedUser(p.jid) : "");
+    const pIdNum = cleanJidNumber(p.id || p.jid);
+
+    // 1. Direct normalized JID match
+    if (targetNorm && (pIdNorm === targetNorm)) return true;
+    // 2. Clean phone number match
+    if (targetNum && (pIdNum === targetNum)) return true;
+
+    // 3. Check sockUser details (specifically for bot check)
+    if (sockUser) {
+      if (sockUserNorm && pIdNorm === sockUserNorm) return true;
+      if (sockUserNum && pIdNum === sockUserNum) return true;
+      if (sockUserLidNorm && pIdNorm === sockUserLidNorm) return true;
+      if (sockUserLidNum && pIdNum === sockUserLidNum) return true;
+    }
+
+    return false;
+  });
+
+  return isParticipantAdmin(participant);
+}
+
 function getMessageText(msg) {
   const m = msg?.message;
   if (!m) return "";
@@ -1571,15 +1623,7 @@ async function startBot() {
           try {
             const metadata = await sock.groupMetadata(chatJid);
             const senderJid = getSenderJid(msg, sock);
-            const participant = metadata.participants?.find(
-              (p) => jidNormalizedUser(p.id) === senderJid
-            );
-            if (participant && (participant.admin === "admin" || participant.admin === "superadmin")) {
-              isAdmin = true;
-            }
-            if (msg.key.fromMe) {
-              isAdmin = true;
-            }
+            isAdmin = msg.key.fromMe || checkUserIsGroupAdmin(metadata, senderJid, sock.user);
           } catch (err) {
             console.error("Error fetching group metadata for badfilter check:", err);
           }
@@ -1866,12 +1910,8 @@ async function startBot() {
         }
 
         const senderJid = getSenderJid(msg, sock);
-        const senderParticipant = groupMetadata.participants?.find(
-          (p) => jidNormalizedUser(p.id) === senderJid
-        );
         const isSenderAdmin =
-          msg.key.fromMe ||
-          !!(senderParticipant && (senderParticipant.admin === "admin" || senderParticipant.admin === "superadmin"));
+          msg.key.fromMe || checkUserIsGroupAdmin(groupMetadata, senderJid, sock.user);
 
         if (!isSenderAdmin) {
           await sock.sendMessage(chatJid, {
@@ -1880,12 +1920,7 @@ async function startBot() {
           continue;
         }
 
-        const botJid = jidNormalizedUser(sock.user.id);
-        const botParticipant = groupMetadata.participants?.find(
-          (p) => jidNormalizedUser(p.id) === botJid
-        );
-        const isBotAdmin =
-          !!(botParticipant && (botParticipant.admin === "admin" || botParticipant.admin === "superadmin"));
+        const isBotAdmin = checkUserIsGroupAdmin(groupMetadata, sock.user?.id || sock.user?.jid, sock.user);
 
         const argsText = text.trim().slice("!badfilter".length).trim();
         const argsLower = argsText.toLowerCase();
