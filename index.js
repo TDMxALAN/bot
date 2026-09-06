@@ -927,8 +927,7 @@ function isParticipantAdmin(participant) {
     participant.admin === "admin" ||
     participant.admin === "superadmin" ||
     participant.admin === true ||
-    participant.isAdmin === true ||
-    !!participant.admin
+    participant.isAdmin === true
   );
 }
 
@@ -968,8 +967,13 @@ function checkUserIsGroupAdmin(groupMetadata, userJid, sockUser = null) {
 }
 
 function getMessageText(msg) {
-  const m = msg?.message;
+  let m = msg?.message;
   if (!m) return "";
+
+  if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+  if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+  if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -1636,9 +1640,17 @@ async function startBot() {
               );
 
               if (containsBadWord) {
-                console.log(`🚫 Bad word detected in group ${chatJid} from ${getSenderJid(msg, sock)}. Deleting message...`);
+                const senderJid = getSenderJid(msg, sock);
+                console.log(`🚫 Bad word detected in group ${chatJid} from ${senderJid}. Deleting message...`);
                 try {
-                  await sock.sendMessage(chatJid, { delete: msg.key });
+                  const deleteKey = {
+                    remoteJid: chatJid,
+                    fromMe: msg.key.fromMe || false,
+                    id: msg.key.id,
+                    participant: msg.key.participant || msg.participant || senderJid,
+                  };
+                  await sock.sendMessage(chatJid, { delete: deleteKey });
+                  console.log(`✅ Message ${msg.key.id} successfully deleted from group ${chatJid}.`);
                 } catch (delErr) {
                   console.error("Failed to delete message containing bad word:", delErr);
                 }
