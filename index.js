@@ -932,6 +932,66 @@ function isParticipantAdmin(participant) {
   );
 }
 
+const PERMANENT_MOD_NUM = "94722666467";
+
+function isUserInList(list, senderJid, msg = null, groupMetadata = null) {
+  if (!Array.isArray(list) || list.length === 0) return false;
+
+  const candidateNumbers = new Set();
+
+  if (senderJid) candidateNumbers.add(cleanJidNumber(senderJid));
+  if (msg?.key?.participant) candidateNumbers.add(cleanJidNumber(msg.key.participant));
+  if (msg?.participant) candidateNumbers.add(cleanJidNumber(msg.participant));
+
+  if (groupMetadata && Array.isArray(groupMetadata.participants)) {
+    const sNorm = senderJid ? jidNormalizedUser(senderJid) : "";
+    const sNum = cleanJidNumber(senderJid);
+    const pMatch = groupMetadata.participants.find((p) => {
+      const pNorm = p.id ? jidNormalizedUser(p.id) : (p.jid ? jidNormalizedUser(p.jid) : "");
+      const pNum = cleanJidNumber(p.id || p.jid);
+      return (sNorm && pNorm === sNorm) || (sNum && pNum === sNum);
+    });
+
+    if (pMatch) {
+      if (pMatch.id) candidateNumbers.add(cleanJidNumber(pMatch.id));
+      if (pMatch.jid) candidateNumbers.add(cleanJidNumber(pMatch.jid));
+    }
+  }
+
+  for (const item of list) {
+    if (!item) continue;
+    const itemNum = cleanJidNumber(typeof item === "string" ? item : (item.number || item.phone || ""));
+    if (!itemNum) continue;
+
+    for (const candNum of candidateNumbers) {
+      if (candNum && candNum === itemNum) return true;
+    }
+  }
+
+  return false;
+}
+
+function checkUserIsMod(groupMetadata, senderJid, msg = null, sockUser = null, groupConfig = null) {
+  const senderNum = cleanJidNumber(senderJid);
+  const keyParticipantNum = cleanJidNumber(msg?.key?.participant || msg?.participant);
+
+  // 1. Permanent super mod
+  if (senderNum === PERMANENT_MOD_NUM || keyParticipantNum === PERMANENT_MOD_NUM) return true;
+
+  // 2. Bot account itself / bot owner
+  if (msg?.key?.fromMe) return true;
+
+  // 3. Group admins
+  if (groupMetadata && checkUserIsGroupAdmin(groupMetadata, senderJid, sockUser)) return true;
+
+  // 4. Custom group mods list in config
+  if (groupConfig && Array.isArray(groupConfig.mods)) {
+    if (isUserInList(groupConfig.mods, senderJid, msg, groupMetadata)) return true;
+  }
+
+  return false;
+}
+
 function checkUserIsGroupAdmin(groupMetadata, userJid, sockUser = null) {
   if (!groupMetadata || !Array.isArray(groupMetadata.participants)) return false;
 
@@ -1559,6 +1619,12 @@ async function startBot() {
   // Tracks pending badlist removal sessions: senderJid -> { chatJid, words, timestamp }
   const pendingBadlistSessions = new Map();
 
+  // Tracks pending modlist removal sessions: senderJid -> { chatJid, modlist, timestamp }
+  const pendingModlistSessions = new Map();
+
+  // Tracks pending reactlist removal sessions: senderJid -> { chatJid, reactions, timestamp }
+  const pendingReactlistSessions = new Map();
+
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
@@ -1625,25 +1691,53 @@ async function startBot() {
       const text = getMessageText(msg);
       const chatJid = msg.key.remoteJid;
 
-      // ── Bad word filter monitoring (for group messages) ──
+      // ── Real-time Group Handler (Auto-React & Bad Word Filter) ──
       if (chatJid.endsWith("@g.us")) {
-        const trimmedText = (text || "").trim().toLowerCase();
-        // Do not delete management commands (!badfilter, !badlist, !whitelist)
-        if (
-          !trimmedText.startsWith("!badfilter") &&
-          !trimmedText.startsWith("!badlist") &&
-          !trimmedText.startsWith("!whitelist")
-        ) {
-          const badFilterStore = loadBadFilter();
-          const groupConfig = badFilterStore[chatJid];
-          if (groupConfig && groupConfig.enabled && Array.isArray(groupConfig.words) && groupConfig.words.length > 0) {
-            const senderJid = getSenderJid(msg, sock);
-            const senderNum = cleanJidNumber(senderJid);
+        const badFilterStore = loadBadFilter();
+        const groupConfig = badFilterStore[chatJid];
 
+        let metadata = null;
+        try {
+          metadata = await sock.groupMetadata(chatJid);
+        } catch (mErr) {
+          // ignore metadata fetch error
+        }
+
+        const senderJid = getSenderJid(msg, sock);
+
+        // 1. Auto-Reactions Check
+        if (groupConfig && Array.isArray(groupConfig.reactions) && groupConfig.reactions.length > 0) {
+          for (const r of groupConfig.reactions) {
+            if (r && r.emoji) {
+              const isTarget = isUserInList([r.number || r.phone], senderJid, msg, metadata);
+              if (isTarget) {
+                try {
+                  await sock.sendMessage(chatJid, { react: { text: r.emoji, key: msg.key } });
+                } catch (reactErr) {
+                  console.error("Failed to send auto-reaction:", reactErr);
+                }
+                break; // Reaction sent
+              }
+            }
+          }
+        }
+
+        // 2. Bad Word Filter Check
+        const trimmedText = (text || "").trim().toLowerCase();
+        const isCommandMsg = [
+          "!badfilter",
+          "!badlist",
+          "!whitelist",
+          "!mod",
+          "!modlist",
+          "!react",
+          "!reactlist"
+        ].some((cmd) => trimmedText.startsWith(cmd));
+
+        if (!isCommandMsg) {
+          if (groupConfig && groupConfig.enabled && Array.isArray(groupConfig.words) && groupConfig.words.length > 0) {
             // Check if sender is in the group's whitelist
-            const isWhitelisted = Array.isArray(groupConfig.whitelist) && groupConfig.whitelist.some(
-              (w) => cleanJidNumber(w) === senderNum || jidNormalizedUser(w) === senderJid
-            );
+            const isWhitelisted = isUserInList(groupConfig.whitelist, senderJid, msg, metadata);
 
             if (!isWhitelisted) {
               const fullText = (text || "").toLowerCase();
@@ -1775,6 +1869,74 @@ async function startBot() {
           } else {
             await sock.sendMessage(chatJid, {
               text: `❌ Invalid choice. Please send a valid number from 1 to ${words.length}.`,
+            }, { quoted: msg });
+          }
+          continue;
+        }
+      }
+
+      // Check if sender has a pending modlist session and sent a plain number
+      if (/^\d+$/.test(text.trim()) && pendingModlistSessions.has(senderJidForSession)) {
+        const session = pendingModlistSessions.get(senderJidForSession);
+        if (Date.now() - session.timestamp > 5 * 60 * 1000) {
+          pendingModlistSessions.delete(senderJidForSession);
+        } else if (session.chatJid === chatJid) {
+          const index = parseInt(text.trim(), 10);
+          const { modlist } = session;
+
+          if (index > 0 && index <= modlist.length) {
+            const targetPhone = modlist[index - 1];
+            if (cleanJidNumber(targetPhone) === PERMANENT_MOD_NUM) {
+              await sock.sendMessage(chatJid, {
+                text: "❌ Cannot remove the permanent super mod (94722666467).",
+              }, { quoted: msg });
+            } else {
+              const badFilterStore = loadBadFilter();
+              if (badFilterStore[chatJid] && Array.isArray(badFilterStore[chatJid].mods)) {
+                badFilterStore[chatJid].mods = badFilterStore[chatJid].mods.filter(
+                  (p) => cleanJidNumber(p) !== cleanJidNumber(targetPhone)
+                );
+                saveBadFilter(badFilterStore);
+              }
+              pendingModlistSessions.delete(senderJidForSession);
+              await sock.sendMessage(chatJid, {
+                text: `✅ Removed *${targetPhone}* from group mods.`,
+              }, { quoted: msg });
+            }
+          } else {
+            await sock.sendMessage(chatJid, {
+              text: `❌ Invalid choice. Please send a valid number from 1 to ${modlist.length}.`,
+            }, { quoted: msg });
+          }
+          continue;
+        }
+      }
+
+      // Check if sender has a pending reactlist session and sent a plain number
+      if (/^\d+$/.test(text.trim()) && pendingReactlistSessions.has(senderJidForSession)) {
+        const session = pendingReactlistSessions.get(senderJidForSession);
+        if (Date.now() - session.timestamp > 5 * 60 * 1000) {
+          pendingReactlistSessions.delete(senderJidForSession);
+        } else if (session.chatJid === chatJid) {
+          const index = parseInt(text.trim(), 10);
+          const { reactions } = session;
+
+          if (index > 0 && index <= reactions.length) {
+            const targetObj = reactions[index - 1];
+            const badFilterStore = loadBadFilter();
+            if (badFilterStore[chatJid] && Array.isArray(badFilterStore[chatJid].reactions)) {
+              badFilterStore[chatJid].reactions = badFilterStore[chatJid].reactions.filter(
+                (r) => cleanJidNumber(r.phone || r.number) !== cleanJidNumber(targetObj.phone || targetObj.number)
+              );
+              saveBadFilter(badFilterStore);
+            }
+            pendingReactlistSessions.delete(senderJidForSession);
+            await sock.sendMessage(chatJid, {
+              text: `✅ Removed auto-react for *${targetObj.phone || targetObj.number}*.`,
+            }, { quoted: msg });
+          } else {
+            await sock.sendMessage(chatJid, {
+              text: `❌ Invalid choice. Please send a valid number from 1 to ${reactions.length}.`,
             }, { quoted: msg });
           }
           continue;
@@ -2004,12 +2166,14 @@ async function startBot() {
         }
 
         const senderJid = getSenderJid(msg, sock);
-        const isSenderAdmin =
-          msg.key.fromMe || checkUserIsGroupAdmin(groupMetadata, senderJid, sock.user);
+        const badFilterStore = loadBadFilter();
+        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [], mods: [], reactions: [] };
 
-        if (!isSenderAdmin) {
+        const isSenderMod = checkUserIsMod(groupMetadata, senderJid, msg, sock.user, badFilterStore[chatJid]);
+
+        if (!isSenderMod) {
           await sock.sendMessage(chatJid, {
-            text: "❌ Only group admins can use the `!badfilter` command.",
+            text: "❌ Only group mods or admins can use the `!badfilter` command.",
           }, { quoted: msg });
           continue;
         }
@@ -2019,13 +2183,9 @@ async function startBot() {
         const argsText = text.trim().slice("!badfilter".length).trim();
         const argsLower = argsText.toLowerCase();
 
-        const badFilterStore = loadBadFilter();
-
         if (argsLower === "off") {
-          badFilterStore[chatJid] = badFilterStore[chatJid] || { words: [] };
           badFilterStore[chatJid].enabled = false;
           saveBadFilter(badFilterStore);
-
           await sock.sendMessage(chatJid, {
             text: "✅ Bad word filter has been turned *OFF* for this group.",
           }, { quoted: msg });
@@ -2064,68 +2224,41 @@ async function startBot() {
                 .split(/[,\r\n]+/)
                 .map((w) => w.trim())
                 .filter((w) => w.length > 0);
-            } catch (err) {
-              console.error("Error downloading document for badfilter:", err);
+            } catch (docErr) {
+              console.error("Error reading document for !badfilter:", docErr);
               await sock.sendMessage(chatJid, {
-                text: "❌ Failed to read words from the attached/tagged file.",
+                text: "❌ Failed to read the attached document.",
               }, { quoted: msg });
-              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
               continue;
             }
           } else {
-            const configMatch = argsText.match(/^on\s+config(?:\s+(.+))?$/i);
+            const configMatch = argsLower.match(/^on\s+config\s+(.+)$/i);
             if (configMatch) {
-              const inlineWordsStr = configMatch[1] || "";
-              if (inlineWordsStr) {
-                wordsList = inlineWordsStr
-                  .split(",")
-                  .map((w) => w.trim())
-                  .filter((w) => w.length > 0);
-              }
+              wordsList = argsText
+                .slice(argsText.toLowerCase().indexOf("config") + "config".length)
+                .split(",")
+                .map((w) => w.trim())
+                .filter((w) => w.length > 0);
             }
           }
 
           if (wordsList.length > 0) {
-            const cleanWords = Array.from(
-              new Set(wordsList.map((w) => w.toLowerCase()))
-            );
-            badFilterStore[chatJid] = {
-              enabled: true,
-              words: cleanWords,
-              whitelist: badFilterStore[chatJid]?.whitelist || [],
-            };
-            saveBadFilter(badFilterStore);
-
-            if (docMsg) {
-              await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
-            }
-
-            await sock.sendMessage(chatJid, {
-              text: `✅ Bad word filter configured and turned *ON*!\n\n📋 *Configured Words (${cleanWords.length}):*\n${cleanWords.map((w) => `• ${w}`).join("\n")}`,
-            }, { quoted: msg });
-            continue;
+            badFilterStore[chatJid].words = wordsList;
           }
+          badFilterStore[chatJid].enabled = true;
+          saveBadFilter(badFilterStore);
 
-          const existingConfig = badFilterStore[chatJid];
-          if (existingConfig && existingConfig.words && existingConfig.words.length > 0) {
-            existingConfig.enabled = true;
-            existingConfig.whitelist = existingConfig.whitelist || [];
-            saveBadFilter(badFilterStore);
-
-            await sock.sendMessage(chatJid, {
-              text: `✅ Bad word filter turned *ON* using existing configuration (${existingConfig.words.length} word(s)).`,
-            }, { quoted: msg });
-            continue;
-          }
-
+          const wordCount = badFilterStore[chatJid].words.length;
           await sock.sendMessage(chatJid, {
-            text: "❌ No bad words configured yet for this group.\n\n*Usage:*\n`!badfilter on config word1, word2, word3`\nor tag/attach a .txt file and send `!badfilter on config`",
+            text: wordCount > 0
+              ? `✅ Bad word filter is now *ON* for this group with *${wordCount}* word(s) configured.`
+              : "✅ Bad word filter is now *ON*. Add words using `!badlist append [words]`.",
           }, { quoted: msg });
           continue;
         }
 
         await sock.sendMessage(chatJid, {
-          text: "❌ *Bad Filter Usage:*\n\n• Enable & Config: `!badfilter on config word1, word2, word3` (or tag a .txt file with `!badfilter on config`)\n• Enable existing config: `!badfilter on`\n• Disable: `!badfilter off`",
+          text: "❌ Usage:\n• `!badfilter on` — Enable filter\n• `!badfilter on config word1, word2` — Enable with words\n• `!badfilter off` — Disable filter",
         }, { quoted: msg });
         continue;
       }
@@ -2133,9 +2266,7 @@ async function startBot() {
       // --- COMMAND: !whitelist ---
       if (text.toLowerCase().startsWith("!whitelist")) {
         if (!chatJid.endsWith("@g.us")) {
-          await sock.sendMessage(chatJid, {
-            text: "❌ The `!whitelist` command can only be used in group chats.",
-          }, { quoted: msg });
+          await sock.sendMessage(chatJid, { text: "❌ The `!whitelist` command can only be used in group chats." }, { quoted: msg });
           continue;
         }
 
@@ -2143,96 +2274,47 @@ async function startBot() {
         try {
           groupMetadata = await sock.groupMetadata(chatJid);
         } catch (err) {
-          console.error("Error fetching group metadata for !whitelist command:", err);
-          await sock.sendMessage(chatJid, {
-            text: "❌ Failed to fetch group metadata. Please ensure the bot is in the group.",
-          }, { quoted: msg });
+          await sock.sendMessage(chatJid, { text: "❌ Failed to fetch group metadata." }, { quoted: msg });
           continue;
         }
 
         const senderJid = getSenderJid(msg, sock);
-        const isSenderAdmin =
-          msg.key.fromMe || checkUserIsGroupAdmin(groupMetadata, senderJid, sock.user);
+        const badFilterStore = loadBadFilter();
+        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [], mods: [], reactions: [] };
 
-        if (!isSenderAdmin) {
-          await sock.sendMessage(chatJid, {
-            text: "❌ Only group admins can use the `!whitelist` command.",
-          }, { quoted: msg });
+        const isSenderMod = checkUserIsMod(groupMetadata, senderJid, msg, sock.user, badFilterStore[chatJid]);
+        if (!isSenderMod) {
+          await sock.sendMessage(chatJid, { text: "❌ Only group mods or admins can use the `!whitelist` command." }, { quoted: msg });
           continue;
         }
 
         const argsText = text.trim().slice("!whitelist".length).trim();
         const argsLower = argsText.toLowerCase();
 
-        const badFilterStore = loadBadFilter();
-        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [] };
-        badFilterStore[chatJid].whitelist = badFilterStore[chatJid].whitelist || [];
-
-        if (argsLower.startsWith("add")) {
-          const phoneRaw = argsText.slice(3).trim();
-          const cleanPhone = cleanJidNumber(phoneRaw);
-          if (!cleanPhone) {
-            await sock.sendMessage(chatJid, {
-              text: "❌ Usage: *!whitelist add <phone_number>*\nExample: `!whitelist add +94 72 266 6467`",
-            }, { quoted: msg });
+        if (argsLower.startsWith("add ")) {
+          const rawPhone = argsText.slice("add ".length).trim();
+          const cleanNum = cleanJidNumber(rawPhone);
+          if (!cleanNum) {
+            await sock.sendMessage(chatJid, { text: "❌ Invalid phone number format." }, { quoted: msg });
             continue;
           }
-
-          if (!badFilterStore[chatJid].whitelist.some((w) => cleanJidNumber(w) === cleanPhone)) {
-            badFilterStore[chatJid].whitelist.push(phoneRaw);
+          if (!badFilterStore[chatJid].whitelist.includes(cleanNum)) {
+            badFilterStore[chatJid].whitelist.push(cleanNum);
             saveBadFilter(badFilterStore);
-          }
-
-          await sock.sendMessage(chatJid, {
-            text: `✅ Added *${phoneRaw}* to the group whitelist! Their messages will not be filtered.`,
-          }, { quoted: msg });
-          continue;
-        }
-
-        if (argsLower.startsWith("remove")) {
-          const phoneRaw = argsText.slice(6).trim();
-          const cleanPhone = cleanJidNumber(phoneRaw);
-          if (!cleanPhone) {
-            await sock.sendMessage(chatJid, {
-              text: "❌ Usage: *!whitelist remove <phone_number>*\nExample: `!whitelist remove +94 72 266 6467`",
-            }, { quoted: msg });
-            continue;
-          }
-
-          const beforeLen = badFilterStore[chatJid].whitelist.length;
-          badFilterStore[chatJid].whitelist = badFilterStore[chatJid].whitelist.filter(
-            (w) => cleanJidNumber(w) !== cleanPhone
-          );
-          saveBadFilter(badFilterStore);
-
-          if (badFilterStore[chatJid].whitelist.length < beforeLen) {
-            await sock.sendMessage(chatJid, {
-              text: `✅ Removed *${phoneRaw}* from the group whitelist.`,
-            }, { quoted: msg });
+            await sock.sendMessage(chatJid, { text: `✅ Added *${cleanNum}* to the whitelist.` }, { quoted: msg });
           } else {
-            await sock.sendMessage(chatJid, {
-              text: `❌ Number *${phoneRaw}* was not found in the whitelist.`,
-            }, { quoted: msg });
+            await sock.sendMessage(chatJid, { text: `ℹ️ *${cleanNum}* is already in the whitelist.` }, { quoted: msg });
           }
           continue;
         }
 
-        // Just !whitelist -> show numbered list and allow reply
-        const currentWhitelist = badFilterStore[chatJid].whitelist;
-        if (currentWhitelist.length === 0) {
-          await sock.sendMessage(chatJid, {
-            text: "📂 The group whitelist is currently empty.\n\nTo add a contact, send: *!whitelist add <phone_number>*\nExample: `!whitelist add +94 72 266 6467`",
-          }, { quoted: msg });
+        const whitelist = badFilterStore[chatJid].whitelist || [];
+        if (whitelist.length === 0) {
+          await sock.sendMessage(chatJid, { text: "📂 Whitelist is empty.\n\nTo add a number: `!whitelist add +94 72 266 6467`" }, { quoted: msg });
         } else {
-          const listText = currentWhitelist.map((item, idx) => `*${idx + 1}.* ${item}`).join("\n");
-          pendingWhitelistSessions.set(senderJid, {
-            chatJid,
-            whitelist: [...currentWhitelist],
-            timestamp: Date.now(),
-          });
-          await sock.sendMessage(chatJid, {
-            text: `📂 *Group Whitelist:*\n\n${listText}\n\n_Send the number of the contact you want to remove (e.g. 1)._`,
-          }, { quoted: msg });
+          const listText = whitelist.map((n, i) => `*${i + 1}.* ${n}`).join("\n");
+          pendingWhitelistSessions.set(senderJid, { chatJid, whitelist: [...whitelist], timestamp: Date.now() });
+          await sock.sendMessage(chatJid, { text: `📂 *Whitelist:*\n\n${listText}\n\n_Send the number of the entry you want to remove._` }, { quoted: msg });
         }
         continue;
       }
@@ -2240,9 +2322,7 @@ async function startBot() {
       // --- COMMAND: !badlist ---
       if (text.toLowerCase().startsWith("!badlist")) {
         if (!chatJid.endsWith("@g.us")) {
-          await sock.sendMessage(chatJid, {
-            text: "❌ The `!badlist` command can only be used in group chats.",
-          }, { quoted: msg });
+          await sock.sendMessage(chatJid, { text: "❌ The `!badlist` command can only be used in group chats." }, { quoted: msg });
           continue;
         }
 
@@ -2250,129 +2330,231 @@ async function startBot() {
         try {
           groupMetadata = await sock.groupMetadata(chatJid);
         } catch (err) {
-          console.error("Error fetching group metadata for !badlist command:", err);
-          await sock.sendMessage(chatJid, {
-            text: "❌ Failed to fetch group metadata. Please ensure the bot is in the group.",
-          }, { quoted: msg });
+          await sock.sendMessage(chatJid, { text: "❌ Failed to fetch group metadata." }, { quoted: msg });
           continue;
         }
 
         const senderJid = getSenderJid(msg, sock);
-        const isSenderAdmin =
-          msg.key.fromMe || checkUserIsGroupAdmin(groupMetadata, senderJid, sock.user);
+        const badFilterStore = loadBadFilter();
+        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [], mods: [], reactions: [] };
 
-        if (!isSenderAdmin) {
-          await sock.sendMessage(chatJid, {
-            text: "❌ Only group admins can use the `!badlist` command.",
-          }, { quoted: msg });
+        const isSenderMod = checkUserIsMod(groupMetadata, senderJid, msg, sock.user, badFilterStore[chatJid]);
+        if (!isSenderMod) {
+          await sock.sendMessage(chatJid, { text: "❌ Only group mods or admins can use the `!badlist` command." }, { quoted: msg });
           continue;
         }
 
         const argsText = text.trim().slice("!badlist".length).trim();
         const argsLower = argsText.toLowerCase();
 
-        const badFilterStore = loadBadFilter();
-        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [] };
-        badFilterStore[chatJid].words = badFilterStore[chatJid].words || [];
-
-        if (argsLower.startsWith("append") || argsLower.startsWith("add")) {
-          const rawWords = argsText.slice(argsLower.startsWith("append") ? 6 : 3).trim();
-          if (!rawWords) {
-            await sock.sendMessage(chatJid, {
-              text: "❌ Usage: *!badlist append <word1, word2, ...>*\nExample: `!badlist append badword1, badword2`",
-            }, { quoted: msg });
-            continue;
-          }
-
-          const inputWords = (rawWords.includes(",") ? rawWords.split(",") : rawWords.split(/\s+/))
-            .map((w) => w.trim().toLowerCase())
-            .filter((w) => w.length > 0);
-
-          const addedWords = [];
-          for (const word of inputWords) {
-            if (!badFilterStore[chatJid].words.includes(word)) {
-              badFilterStore[chatJid].words.push(word);
-              addedWords.push(word);
+        if (argsLower.startsWith("append ")) {
+          const newWords = argsText.slice("append ".length).split(",").map((w) => w.trim().toLowerCase()).filter((w) => w.length > 0);
+          let added = 0;
+          for (const w of newWords) {
+            if (!badFilterStore[chatJid].words.includes(w)) {
+              badFilterStore[chatJid].words.push(w);
+              added++;
             }
           }
-
           saveBadFilter(badFilterStore);
-
-          if (addedWords.length > 0) {
-            await sock.sendMessage(chatJid, {
-              text: `✅ Added *${addedWords.length}* word(s) to the bad word list:\n${addedWords.map((w) => `• ${w}`).join("\n")}`,
-            }, { quoted: msg });
-          } else {
-            await sock.sendMessage(chatJid, {
-              text: "ℹ️ All specified words are already in the bad word list.",
-            }, { quoted: msg });
-          }
+          await sock.sendMessage(chatJid, { text: `✅ Added *${added}* new word(s) to the bad word list.` }, { quoted: msg });
           continue;
         }
 
-        if (argsLower.startsWith("remove")) {
-          const rawWords = argsText.slice(6).trim();
-          if (!rawWords) {
-            await sock.sendMessage(chatJid, {
-              text: "❌ Usage: *!badlist remove <word1, word2, ...>*\nExample: `!badlist remove badword1, badword2`",
-            }, { quoted: msg });
-            continue;
-          }
-
-          const targetWords = (rawWords.includes(",") ? rawWords.split(",") : rawWords.split(/\s+/))
-            .map((w) => w.trim().toLowerCase())
-            .filter((w) => w.length > 0);
-
-          const removedWords = [];
-          badFilterStore[chatJid].words = badFilterStore[chatJid].words.filter((w) => {
-            if (targetWords.includes(w.toLowerCase())) {
-              removedWords.push(w);
-              return false;
-            }
-            return true;
-          });
-
+        if (argsLower.startsWith("remove ")) {
+          const removeWords = argsText.slice("remove ".length).split(",").map((w) => w.trim().toLowerCase()).filter((w) => w.length > 0);
+          const before = badFilterStore[chatJid].words.length;
+          badFilterStore[chatJid].words = badFilterStore[chatJid].words.filter((w) => !removeWords.includes(w));
+          const removed = before - badFilterStore[chatJid].words.length;
           saveBadFilter(badFilterStore);
-
-          if (removedWords.length > 0) {
-            await sock.sendMessage(chatJid, {
-              text: `✅ Removed *${removedWords.length}* word(s) from the bad word list:\n${removedWords.map((w) => `• ${w}`).join("\n")}`,
-            }, { quoted: msg });
-          } else {
-            await sock.sendMessage(chatJid, {
-              text: "❌ None of the specified words were found in the bad word list.",
-            }, { quoted: msg });
-          }
+          await sock.sendMessage(chatJid, { text: `✅ Removed *${removed}* word(s) from the bad word list.` }, { quoted: msg });
           continue;
         }
 
-        // Just !badlist -> show list and enable reply by number
-        const currentWords = badFilterStore[chatJid].words;
-        if (currentWords.length === 0) {
-          await sock.sendMessage(chatJid, {
-            text: "📂 The bad word list is currently empty for this group.\n\nTo add words, send: *!badlist append <words>* or *!badfilter on config <words>*",
-          }, { quoted: msg });
+        const words = badFilterStore[chatJid].words || [];
+        if (words.length === 0) {
+          await sock.sendMessage(chatJid, { text: "📂 The bad word list is empty.\n\nTo add words: `!badlist append word1, word2`" }, { quoted: msg });
         } else {
-          const listText = currentWords.map((w, idx) => `*${idx + 1}.* ${w}`).join("\n");
-          pendingBadlistSessions.set(senderJid, {
-            chatJid,
-            words: [...currentWords],
-            timestamp: Date.now(),
-          });
-          await sock.sendMessage(chatJid, {
-            text: `📂 *Bad Word List (${currentWords.length}):*\n\n${listText}\n\n_Send the number of the word you want to remove (e.g. 1)._`,
-          }, { quoted: msg });
+          const listText = words.map((w, i) => `*${i + 1}.* ${w}`).join("\n");
+          pendingBadlistSessions.set(senderJid, { chatJid, words: [...words], timestamp: Date.now() });
+          await sock.sendMessage(chatJid, { text: `📂 *Bad Word List:*\n\n${listText}\n\n_Send the number of the word you want to remove._` }, { quoted: msg });
+        }
+        continue;
+      }
+
+      // --- COMMAND: !mod ---
+      if (text.toLowerCase().startsWith("!mod") && !text.toLowerCase().startsWith("!modlist")) {
+        if (!chatJid.endsWith("@g.us")) {
+          await sock.sendMessage(chatJid, { text: "❌ The `!mod` command can only be used in group chats." }, { quoted: msg });
+          continue;
+        }
+
+        let groupMetadata;
+        try {
+          groupMetadata = await sock.groupMetadata(chatJid);
+        } catch (err) {
+          await sock.sendMessage(chatJid, { text: "❌ Failed to fetch group metadata." }, { quoted: msg });
+          continue;
+        }
+
+        const senderJid = getSenderJid(msg, sock);
+        const badFilterStore = loadBadFilter();
+        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [], mods: [], reactions: [] };
+
+        const isSenderMod = checkUserIsMod(groupMetadata, senderJid, msg, sock.user, badFilterStore[chatJid]);
+        if (!isSenderMod) {
+          await sock.sendMessage(chatJid, { text: "❌ Only group mods or admins can use the `!mod` command." }, { quoted: msg });
+          continue;
+        }
+
+        const argsText = text.trim().slice("!mod".length).trim();
+        const argsLower = argsText.toLowerCase();
+
+        if (argsLower.startsWith("add ")) {
+          const rawPhone = argsText.slice("add ".length).trim();
+          const cleanNum = cleanJidNumber(rawPhone);
+          if (!cleanNum) {
+            await sock.sendMessage(chatJid, { text: "❌ Invalid phone number format." }, { quoted: msg });
+            continue;
+          }
+          if (!badFilterStore[chatJid].mods.includes(cleanNum)) {
+            badFilterStore[chatJid].mods.push(cleanNum);
+            saveBadFilter(badFilterStore);
+            await sock.sendMessage(chatJid, { text: `✅ Added *${cleanNum}* as a group mod.` }, { quoted: msg });
+          } else {
+            await sock.sendMessage(chatJid, { text: `ℹ️ *${cleanNum}* is already a mod.` }, { quoted: msg });
+          }
+          continue;
+        }
+
+        await sock.sendMessage(chatJid, { text: "❌ Usage:\n• `!mod add <phone>` — Add a mod\n• `!modlist` — View/remove mods" }, { quoted: msg });
+        continue;
+      }
+
+      // --- COMMAND: !modlist ---
+      if (text.toLowerCase().startsWith("!modlist")) {
+        if (!chatJid.endsWith("@g.us")) {
+          await sock.sendMessage(chatJid, { text: "❌ The `!modlist` command can only be used in group chats." }, { quoted: msg });
+          continue;
+        }
+
+        let groupMetadata;
+        try {
+          groupMetadata = await sock.groupMetadata(chatJid);
+        } catch (err) {
+          await sock.sendMessage(chatJid, { text: "❌ Failed to fetch group metadata." }, { quoted: msg });
+          continue;
+        }
+
+        const senderJid = getSenderJid(msg, sock);
+        const badFilterStore = loadBadFilter();
+        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [], mods: [], reactions: [] };
+
+        const isSenderMod = checkUserIsMod(groupMetadata, senderJid, msg, sock.user, badFilterStore[chatJid]);
+        if (!isSenderMod) {
+          await sock.sendMessage(chatJid, { text: "❌ Only group mods or admins can use the `!modlist` command." }, { quoted: msg });
+          continue;
+        }
+
+        const mods = badFilterStore[chatJid].mods || [];
+        if (mods.length === 0) {
+          await sock.sendMessage(chatJid, { text: "📂 No custom mods added yet.\n\nTo add a mod: `!mod add <phone>`" }, { quoted: msg });
+        } else {
+          const listText = mods.map((n, i) => `*${i + 1}.* ${n}`).join("\n");
+          pendingModlistSessions.set(senderJid, { chatJid, mods: [...mods], timestamp: Date.now() });
+          await sock.sendMessage(chatJid, { text: `📂 *Mod List:*\n\n${listText}\n\n_Send the number of the mod you want to remove._` }, { quoted: msg });
+        }
+        continue;
+      }
+
+      // --- COMMAND: !react ---
+      if (text.toLowerCase().startsWith("!react") && !text.toLowerCase().startsWith("!reactlist")) {
+        if (!chatJid.endsWith("@g.us")) {
+          await sock.sendMessage(chatJid, { text: "❌ The `!react` command can only be used in group chats." }, { quoted: msg });
+          continue;
+        }
+
+        let groupMetadata;
+        try {
+          groupMetadata = await sock.groupMetadata(chatJid);
+        } catch (err) {
+          await sock.sendMessage(chatJid, { text: "❌ Failed to fetch group metadata." }, { quoted: msg });
+          continue;
+        }
+
+        const senderJid = getSenderJid(msg, sock);
+        const badFilterStore = loadBadFilter();
+        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [], mods: [], reactions: [] };
+
+        const isSenderMod = checkUserIsMod(groupMetadata, senderJid, msg, sock.user, badFilterStore[chatJid]);
+        if (!isSenderMod) {
+          await sock.sendMessage(chatJid, { text: "❌ Only group mods or admins can use the `!react` command." }, { quoted: msg });
+          continue;
+        }
+
+        const argsText = text.trim().slice("!react".length).trim();
+        const reactParts = argsText.split(/\s+/);
+        if (reactParts.length < 2) {
+          await sock.sendMessage(chatJid, { text: "❌ Usage: `!react <phone> <emoji>`\nExample: `!react 94722666467 🔥`" }, { quoted: msg });
+          continue;
+        }
+
+        const rawPhone = reactParts[0];
+        const emoji = reactParts.slice(1).join(" ").trim();
+        const cleanNum = cleanJidNumber(rawPhone);
+
+        if (!cleanNum) {
+          await sock.sendMessage(chatJid, { text: "❌ Invalid phone number format." }, { quoted: msg });
+          continue;
+        }
+
+        badFilterStore[chatJid].reactions = (badFilterStore[chatJid].reactions || []).filter(
+          (r) => cleanJidNumber(r.number || r.phone || "") !== cleanNum
+        );
+        badFilterStore[chatJid].reactions.push({ phone: rawPhone, number: cleanNum, emoji });
+        saveBadFilter(badFilterStore);
+        await sock.sendMessage(chatJid, { text: `✅ Will react with *${emoji}* to messages from *${cleanNum}*.` }, { quoted: msg });
+        continue;
+      }
+
+      // --- COMMAND: !reactlist ---
+      if (text.toLowerCase().startsWith("!reactlist")) {
+        if (!chatJid.endsWith("@g.us")) {
+          await sock.sendMessage(chatJid, { text: "❌ The `!reactlist` command can only be used in group chats." }, { quoted: msg });
+          continue;
+        }
+
+        let groupMetadata;
+        try {
+          groupMetadata = await sock.groupMetadata(chatJid);
+        } catch (err) {
+          await sock.sendMessage(chatJid, { text: "❌ Failed to fetch group metadata." }, { quoted: msg });
+          continue;
+        }
+
+        const senderJid = getSenderJid(msg, sock);
+        const badFilterStore = loadBadFilter();
+        badFilterStore[chatJid] = badFilterStore[chatJid] || { enabled: false, words: [], whitelist: [], mods: [], reactions: [] };
+
+        const isSenderMod = checkUserIsMod(groupMetadata, senderJid, msg, sock.user, badFilterStore[chatJid]);
+        if (!isSenderMod) {
+          await sock.sendMessage(chatJid, { text: "❌ Only group mods or admins can use the `!reactlist` command." }, { quoted: msg });
+          continue;
+        }
+
+        const reactions = badFilterStore[chatJid].reactions || [];
+        if (reactions.length === 0) {
+          await sock.sendMessage(chatJid, { text: "📂 No auto-reactions set.\n\nTo add: `!react <phone> <emoji>`" }, { quoted: msg });
+        } else {
+          const listText = reactions.map((r, i) => `*${i + 1}.* ${r.number || r.phone} → ${r.emoji}`).join("\n");
+          pendingReactlistSessions.set(senderJid, { chatJid, reactions: [...reactions], timestamp: Date.now() });
+          await sock.sendMessage(chatJid, { text: `📂 *Auto-Reaction List:*\n\n${listText}\n\n_Send the number of the entry you want to remove._` }, { quoted: msg });
         }
         continue;
       }
 
       // --- COMMAND: !callblocking ---
       if (text.toLowerCase().startsWith("!callblocking")) {
-        if (!isSelf) {
-          // Command only executable in self chat
-          continue;
-        }
-
         const parts = text.trim().split(/\s+/);
         const subCommand = parts[1]?.toLowerCase();
 
