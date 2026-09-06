@@ -65,12 +65,34 @@ const WATCHLIST_FILE = path.join(DATA_DIR, "watchlist.json");
 // Callblocking storage path
 const CALLBLOCKING_FILE = path.join(DATA_DIR, "callblocking.json");
 
+// Badfilter storage path
+const BADFILTER_FILE = path.join(DATA_DIR, "badfilter.json");
+
 // Active YouTube download requests mapping (messageId -> { url, requesterJid })
 const activeYtRequests = new Map();
 
 // ──────────────────────────────────────────────
-// Watchlist and Callblocking persistence functions
+// Persistence functions
 // ──────────────────────────────────────────────
+
+function loadBadFilter() {
+  try {
+    if (fs.existsSync(BADFILTER_FILE)) {
+      return JSON.parse(fs.readFileSync(BADFILTER_FILE, "utf-8"));
+    }
+  } catch (err) {
+    console.error("Error loading badfilter:", err);
+  }
+  return {};
+}
+
+function saveBadFilter(badfilterData) {
+  try {
+    fs.writeFileSync(BADFILTER_FILE, JSON.stringify(badfilterData, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Error saving badfilter:", err);
+  }
+}
 
 function loadCallBlocking() {
   try {
@@ -893,6 +915,20 @@ function getSenderJid(msg, sock) {
   return jidNormalizedUser(msg.key.remoteJid);
 }
 
+function getMessageText(msg) {
+  const m = msg?.message;
+  if (!m) return "";
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.documentWithIgnoreReportMessage?.message?.documentMessage?.caption ||
+    ""
+  );
+}
+
 function isProfilePicNotFoundError(err) {
   if (!err) return false;
   const status = err.output?.statusCode || err.statusCode || err.status || err.data;
@@ -1523,12 +1559,51 @@ async function startBot() {
       }
 
       // Read message text
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        "";
-
+      const text = getMessageText(msg);
       const chatJid = msg.key.remoteJid;
+
+      // ── Bad word filter monitoring (for group messages) ──
+      if (chatJid.endsWith("@g.us")) {
+        const badFilterStore = loadBadFilter();
+        const groupConfig = badFilterStore[chatJid];
+        if (groupConfig && groupConfig.enabled && groupConfig.words && groupConfig.words.length > 0) {
+          let isAdmin = false;
+          try {
+            const metadata = await sock.groupMetadata(chatJid);
+            const senderJid = getSenderJid(msg, sock);
+            const participant = metadata.participants?.find(
+              (p) => jidNormalizedUser(p.id) === senderJid
+            );
+            if (participant && (participant.admin === "admin" || participant.admin === "superadmin")) {
+              isAdmin = true;
+            }
+            if (msg.key.fromMe) {
+              isAdmin = true;
+            }
+          } catch (err) {
+            console.error("Error fetching group metadata for badfilter check:", err);
+          }
+
+          if (!isAdmin) {
+            const fullText = text.toLowerCase();
+            if (fullText) {
+              const containsBadWord = groupConfig.words.some((word) =>
+                word && fullText.includes(word.toLowerCase())
+              );
+
+              if (containsBadWord) {
+                console.log(`🚫 Bad word detected in group ${chatJid} from ${getSenderJid(msg, sock)}. Deleting message...`);
+                try {
+                  await sock.sendMessage(chatJid, { delete: msg.key });
+                } catch (delErr) {
+                  console.error("Failed to delete message containing bad word:", delErr);
+                }
+                continue; // Quietly delete and skip further handling
+              }
+            }
+          }
+        }
+      }
 
       // Check if sender has a pending watchlist session and sent a plain number
       const senderJidForSession = getSenderJid(msg, sock);
@@ -1767,6 +1842,160 @@ async function startBot() {
           }, { quoted: msg });
           await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
         }
+        continue;
+      }
+
+      // --- COMMAND: !badfilter ---
+      if (text.toLowerCase().startsWith("!badfilter")) {
+        if (!chatJid.endsWith("@g.us")) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ The `!badfilter` command can only be used in group chats.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        let groupMetadata;
+        try {
+          groupMetadata = await sock.groupMetadata(chatJid);
+        } catch (err) {
+          console.error("Error fetching group metadata for !badfilter command:", err);
+          await sock.sendMessage(chatJid, {
+            text: "❌ Failed to fetch group metadata. Please ensure the bot is in the group.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        const senderJid = getSenderJid(msg, sock);
+        const senderParticipant = groupMetadata.participants?.find(
+          (p) => jidNormalizedUser(p.id) === senderJid
+        );
+        const isSenderAdmin =
+          msg.key.fromMe ||
+          !!(senderParticipant && (senderParticipant.admin === "admin" || senderParticipant.admin === "superadmin"));
+
+        if (!isSenderAdmin) {
+          await sock.sendMessage(chatJid, {
+            text: "❌ Only group admins can use the `!badfilter` command.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        const botJid = jidNormalizedUser(sock.user.id);
+        const botParticipant = groupMetadata.participants?.find(
+          (p) => jidNormalizedUser(p.id) === botJid
+        );
+        const isBotAdmin =
+          !!(botParticipant && (botParticipant.admin === "admin" || botParticipant.admin === "superadmin"));
+
+        const argsText = text.trim().slice("!badfilter".length).trim();
+        const argsLower = argsText.toLowerCase();
+
+        const badFilterStore = loadBadFilter();
+
+        if (argsLower === "off") {
+          badFilterStore[chatJid] = badFilterStore[chatJid] || { words: [] };
+          badFilterStore[chatJid].enabled = false;
+          saveBadFilter(badFilterStore);
+
+          await sock.sendMessage(chatJid, {
+            text: "✅ Bad word filter has been turned *OFF* for this group.",
+          }, { quoted: msg });
+          continue;
+        }
+
+        if (argsLower.startsWith("on")) {
+          if (!isBotAdmin) {
+            await sock.sendMessage(chatJid, {
+              text: "❌ I need to be a group admin to enable bad word filtering. Please promote me first.",
+            }, { quoted: msg });
+            continue;
+          }
+
+          const quotedMsg =
+            msg.message?.extendedTextMessage?.contextInfo?.quotedMessage ||
+            msg.message?.imageMessage?.contextInfo?.quotedMessage ||
+            msg.message?.videoMessage?.contextInfo?.quotedMessage ||
+            msg.message?.stickerMessage?.contextInfo?.quotedMessage ||
+            msg.message?.documentMessage?.contextInfo?.quotedMessage;
+
+          const docMsg =
+            msg.message?.documentMessage ||
+            msg.message?.documentWithIgnoreReportMessage?.message?.documentMessage ||
+            quotedMsg?.documentMessage ||
+            quotedMsg?.documentWithIgnoreReportMessage?.message?.documentMessage;
+
+          let wordsList = [];
+
+          if (docMsg) {
+            try {
+              await sock.sendMessage(chatJid, { react: { text: "⏳", key: msg.key } });
+              const docBuffer = await downloadMediaMessage(docMsg, "document");
+              const docText = docBuffer.toString("utf-8");
+              wordsList = docText
+                .split(/[,\r\n]+/)
+                .map((w) => w.trim())
+                .filter((w) => w.length > 0);
+            } catch (err) {
+              console.error("Error downloading document for badfilter:", err);
+              await sock.sendMessage(chatJid, {
+                text: "❌ Failed to read words from the attached/tagged file.",
+              }, { quoted: msg });
+              await sock.sendMessage(chatJid, { react: { text: "❌", key: msg.key } });
+              continue;
+            }
+          } else {
+            const configMatch = argsText.match(/^on\s+config(?:\s+(.+))?$/i);
+            if (configMatch) {
+              const inlineWordsStr = configMatch[1] || "";
+              if (inlineWordsStr) {
+                wordsList = inlineWordsStr
+                  .split(",")
+                  .map((w) => w.trim())
+                  .filter((w) => w.length > 0);
+              }
+            }
+          }
+
+          if (wordsList.length > 0) {
+            const cleanWords = Array.from(
+              new Set(wordsList.map((w) => w.toLowerCase()))
+            );
+            badFilterStore[chatJid] = {
+              enabled: true,
+              words: cleanWords,
+            };
+            saveBadFilter(badFilterStore);
+
+            if (docMsg) {
+              await sock.sendMessage(chatJid, { react: { text: "✅", key: msg.key } });
+            }
+
+            await sock.sendMessage(chatJid, {
+              text: `✅ Bad word filter configured and turned *ON*!\n\n📋 *Configured Words (${cleanWords.length}):*\n${cleanWords.map((w) => `• ${w}`).join("\n")}`,
+            }, { quoted: msg });
+            continue;
+          }
+
+          const existingConfig = badFilterStore[chatJid];
+          if (existingConfig && existingConfig.words && existingConfig.words.length > 0) {
+            existingConfig.enabled = true;
+            saveBadFilter(badFilterStore);
+
+            await sock.sendMessage(chatJid, {
+              text: `✅ Bad word filter turned *ON* using existing configuration (${existingConfig.words.length} word(s)).`,
+            }, { quoted: msg });
+            continue;
+          }
+
+          await sock.sendMessage(chatJid, {
+            text: "❌ No bad words configured yet for this group.\n\n*Usage:*\n`!badfilter on config word1, word2, word3`\nor tag/attach a .txt file and send `!badfilter on config`",
+          }, { quoted: msg });
+          continue;
+        }
+
+        await sock.sendMessage(chatJid, {
+          text: "❌ *Bad Filter Usage:*\n\n• Enable & Config: `!badfilter on config word1, word2, word3` (or tag a .txt file with `!badfilter on config`)\n• Enable existing config: `!badfilter on`\n• Disable: `!badfilter off`",
+        }, { quoted: msg });
         continue;
       }
 
